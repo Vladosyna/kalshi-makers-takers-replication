@@ -1,0 +1,191 @@
+{
+  "ts": "2026-07-16T10:33:22+00:00",
+  "base_url": "https://external-api.kalshi.com/trade-api/v2",
+  "verdict": "GO",
+  "stop_reason": null,
+  "checks": [
+    {
+      "id": 1,
+      "name": "Unauthenticated access",
+      "status": "PASS",
+      "evidence": {
+        "markets_returned": 5,
+        "trades_returned": 5
+      },
+      "notes": "Both /markets and /trades respond without any auth header."
+    },
+    {
+      "id": 2,
+      "name": "2021-2022 positive-check",
+      "status": "PARTIAL",
+      "evidence": {
+        "discovery": {
+          "historical_cutoff": {
+            "market_settled_ts": "2026-05-17T00:00:00Z",
+            "trades_created_ts": "2026-05-17T00:00:00Z"
+          },
+          "live_endpoint_candidate_count": 0,
+          "series_tried": [
+            "KXHIGHNY"
+          ],
+          "series_pages_fetched": {
+            "KXHIGHNY": 9
+          },
+          "historical_fallback_candidate_count": 1447,
+          "fallback_used": true,
+          "candidate_tickers": [
+            "HIGHNY-22DEC30-T57",
+            "HIGHNY-22DEC30-B56.5",
+            "HIGHNY-22DEC30-B54.5",
+            "HIGHNY-22DEC30-B52.5",
+            "HIGHNY-22DEC30-B50.5"
+          ]
+        },
+        "markets": [
+          {
+            "ticker": "HIGHNY-22DEC30-T57",
+            "close_time": "2022-12-31T04:59:00Z",
+            "volume_fp": 3847.0,
+            "metadata_source": "historical",
+            "metadata_close_time_in_window": true,
+            "trade_count": 152,
+            "trades_source": "historical",
+            "volume_consistent": true,
+            "ok": true
+          },
+          {
+            "ticker": "HIGHNY-22DEC30-B56.5",
+            "close_time": "2022-12-31T04:59:00Z",
+            "volume_fp": 2628.0,
+            "metadata_source": "historical",
+            "metadata_close_time_in_window": true,
+            "trade_count": 107,
+            "trades_source": "historical",
+            "volume_consistent": true,
+            "ok": true
+          },
+          {
+            "ticker": "HIGHNY-22DEC30-B54.5",
+            "close_time": "2022-12-31T04:59:00Z",
+            "volume_fp": 3162.0,
+            "metadata_source": "historical",
+            "metadata_close_time_in_window": true,
+            "trade_count": 79,
+            "trades_source": "historical",
+            "volume_consistent": true,
+            "ok": true
+          },
+          {
+            "ticker": "HIGHNY-22DEC30-B52.5",
+            "close_time": "2022-12-31T04:59:00Z",
+            "volume_fp": 2393.0,
+            "metadata_source": "historical",
+            "metadata_close_time_in_window": true,
+            "trade_count": 53,
+            "trades_source": "historical",
+            "volume_consistent": true,
+            "ok": true
+          },
+          {
+            "ticker": "HIGHNY-22DEC30-B50.5",
+            "close_time": "2022-12-31T04:59:00Z",
+            "volume_fp": 1152.0,
+            "metadata_source": "historical",
+            "metadata_close_time_in_window": true,
+            "trade_count": 11,
+            "trades_source": "historical",
+            "volume_consistent": true,
+            "ok": true
+          }
+        ]
+      },
+      "notes": "All 5 sample markets yielded real 2021-2022 metadata and trade history, via the /historical/* fallback for at least one."
+    },
+    {
+      "id": 3,
+      "name": "Taker-field population",
+      "status": "PASS",
+      "evidence": {
+        "eras": {
+          "2021-2022": {
+            "ticker": "HIGHNY-22DEC30-T57",
+            "trade_count": 152,
+            "source": "historical",
+            "taker_outcome_side_population": 1.0,
+            "taker_book_side_population": 1.0,
+            "taker_side_legacy_population": 1.0
+          },
+          "2023": {
+            "ticker": "USDJPY-23DEC2510-T143.749",
+            "trade_count": 0,
+            "source": "none"
+          },
+          "2024": {
+            "ticker": "KXWTIW-24DEC27-T74.99",
+            "trade_count": 0,
+            "source": "none"
+          },
+          "2025-jan-apr": {
+            "ticker": "KXWTIW-25APR25-T70.99",
+            "trade_count": 0,
+            "source": "none"
+          }
+        }
+      },
+      "notes": "taker_outcome_side/taker_book_side population by era, with legacy taker_side tracked as a comparison point. Low population in an era is a documented degradation for Phase 6's fee/return work, not a failure -- taker_side remains live and populated per Kalshi's own deprecation notice."
+    },
+    {
+      "id": 4,
+      "name": "/trades timestamp bracketing",
+      "status": "PASS",
+      "evidence": {
+        "ticker": "HIGHNY-22DEC30-T57",
+        "full_count": 152,
+        "bracketed_count": 77,
+        "range": [
+          1672358682,
+          1672451480
+        ],
+        "bracket": [
+          1672389614,
+          1672420547
+        ]
+      },
+      "notes": "min_ts/max_ts returns a strictly bounded subset."
+    },
+    {
+      "id": 5,
+      "name": "Quote availability for spread filter",
+      "status": "PARTIAL",
+      "evidence": {
+        "eras": {
+          "2021-2022": {
+            "ticker": "HIGHNY-22DEC30-T57",
+            "candle_count": 9,
+            "source": "historical",
+            "has_quote": true
+          },
+          "2023": {
+            "ticker": "USDJPY-23DEC2510-T143.749",
+            "candle_count": 0,
+            "source": "historical",
+            "has_quote": false
+          },
+          "2024": {
+            "ticker": "KXWTIW-24DEC27-T74.99",
+            "candle_count": 0,
+            "source": "historical",
+            "has_quote": false
+          },
+          "2025-jan-apr": {
+            "ticker": "KXWTIW-25APR25-T70.99",
+            "candle_count": 0,
+            "source": "historical",
+            "has_quote": false
+          }
+        }
+      },
+      "notes": "Non-null yes_bid/yes_ask near each market's close_time, checked live then /historical/*. PARTIAL/FAIL eras document exactly where the spread<=20c filter (Phase 3) will need a substitute or a coverage caveat."
+    }
+  ]
+}

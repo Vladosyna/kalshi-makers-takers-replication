@@ -1,0 +1,44 @@
+# Kalshi Makers & Takers Replication -- configuration.
+# All defaults documented; change values here, not in code.
+
+kalshi:
+  # Confirmed live 2026-07-15 against docs.kalshi.com: /markets, /trades,
+  # /series/{s}/markets/{t}/candlesticks, /historical/trades, and
+  # /historical/markets/{t}/candlesticks all show security:[] (public, no
+  # auth) in the OpenAPI spec. Step Zero re-verifies this empirically rather
+  # than trusting the docs alone (guardrail: verify, don't infer).
+  base_url: "https://external-api.kalshi.com/trade-api/v2"
+  rate_limit:
+    # Spec S3 pins "<=5 req/s sustained" explicitly for the fetch pipeline;
+    # applied here too since Kalshi's public/unauthenticated rate limit is
+    # UNDOCUMENTED (only authenticated tiers are published) -- conservative
+    # by design, not copied from the sibling lab's 8 req/s (that number was
+    # tuned for a different cadence/purpose).
+    requests_per_second: 5
+    burst: 10
+  # Step Zero's own discovery step finds these; ships empty since real
+  # tickers aren't known until Step Zero runs. Once found, worth pinning
+  # here so reruns are deterministic instead of re-discovering a (possibly
+  # different) sample every time.
+  known_early_tickers: []
+
+dates:
+  # Spec S1/S2/S6 -- pinned boundaries. All "same time" comparisons in
+  # US/Eastern per spec S3; dates below are calendar dates, tz resolved at
+  # the point of use, not baked in here.
+  r1_window: { start: "2021-01-01", end: "2025-04-30" }
+  r2_window: { start: "2025-05-01", end: "2026-06-30" }
+  boundaries:
+    fee_change: "2025-05-01"
+    publication: "2025-09-08"
+  r3_window_start: "2026-07-04"
+
+storage:
+  db_path: data/kmt.db
+  raw_dir: data/raw
+  parquet_dir: data/parquet
+  logs_dir: data/logs
+  reports_dir: reports
+
+logging:
+  level: INFO

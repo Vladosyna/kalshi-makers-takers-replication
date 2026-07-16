@@ -1,0 +1,33 @@
+[project]
+name = "kalshi-makers-takers-replication"
+version = "0.1.0"
+description = "Replication and extension of Burgi, Deng & Whelan's 'Makers and Takers: The Economics of the Kalshi Prediction Market' -- read-only research instrument, no execution code."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "tenacity>=8.2",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "typer>=0.12",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+kmt = "kalshi_mt.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kalshi_mt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
