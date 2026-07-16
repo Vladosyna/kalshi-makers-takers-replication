@@ -30,6 +30,7 @@ from typing import Any, Literal
 import httpx
 
 from kalshi_mt.api.kalshi import KalshiClient, KalshiMarket
+from kalshi_mt.util import iso_to_epoch as _parse_iso_epoch
 
 log = logging.getLogger(__name__)
 
@@ -47,16 +48,6 @@ class CheckResult:
 
 def _epoch(y: int, m: int, d: int = 1) -> int:
     return int(datetime(y, m, d, tzinfo=timezone.utc).timestamp())
-
-
-def _parse_iso_epoch(value: str | None) -> int | None:
-    if not value:
-        return None
-    try:
-        v = value.replace("Z", "+00:00")
-        return int(datetime.fromisoformat(v).timestamp())
-    except (ValueError, TypeError):
-        return None
 
 
 def _is_auth_error(exc: BaseException) -> bool:

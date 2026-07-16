@@ -7,14 +7,59 @@ import logging
 import logging.handlers
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+
+# Spec S3: "all 'same time' comparisons in US Eastern Time." zoneinfo (not a
+# fixed offset, not pytz) is required here specifically because DST-correct
+# "same wall-clock time N calendar days back" arithmetic depends on it: a
+# zoneinfo-aware datetime recomputes its UTC offset from its own wall-clock
+# fields on demand, so `dt - timedelta(days=N)` on an ET-aware datetime lands
+# on the correct wall-clock instant even across a DST transition -- a fixed
+# UTC offset (or pytz's eager-localization model) would silently drift by an
+# hour on exactly the days that matter most for this kind of panel.
+ET = ZoneInfo("America/New_York")
+
+
+def epoch_to_et(epoch: int) -> datetime:
+    """A Unix epoch second as an ET-aware datetime."""
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone(ET)
+
+
+def et_to_epoch(dt_et: datetime) -> int:
+    """An ET-aware (or ET-naive, assumed ET) datetime back to a Unix epoch second."""
+    if dt_et.tzinfo is None:
+        dt_et = dt_et.replace(tzinfo=ET)
+    return int(dt_et.timestamp())
+
+
+def shift_et_calendar_days(dt_et: datetime, days: int) -> datetime:
+    """`days` calendar days back (or forward if negative -days), same
+    wall-clock time, DST-correct (see the ET/zoneinfo note above)."""
+    return dt_et - timedelta(days=days)
+
+
+def et_day_start(dt_et: datetime) -> datetime:
+    """00:00:00 ET on `dt_et`'s own calendar date."""
+    return dt_et.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def iso_to_epoch(value: str | None) -> int | None:
+    """Parse a Kalshi ISO-8601 timestamp string ('...Z' or '+00:00') to a
+    Unix epoch second, or None if unparseable/absent."""
+    if not value:
+        return None
+    try:
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except (ValueError, TypeError):
+        return None
 
 
 def use_stable_event_loop() -> None:
