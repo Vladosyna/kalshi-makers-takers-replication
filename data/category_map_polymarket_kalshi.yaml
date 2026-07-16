@@ -1,0 +1,48 @@
+# Polymarket category/tag -> Kalshi category string (docs/analysis_plan.md
+# S2.4's control-venue overlay, src/kalshi_mt/control/polymarket.py).
+#
+# [VERIFY] best-effort mapping: this repo has not yet collected a real
+# sample of Kalshi's own native `category` strings (Pass 1's series/category
+# resolution is still running as of this file's creation -- see
+# fetch/pass1.py's resolve_series_and_category; Kalshi's categories come
+# dynamically from its own API and are not a hardcoded enum anywhere in this
+# codebase). The Kalshi-side values below are Kalshi's publicly documented
+# category taxonomy (kalshi.com's own site navigation as of research time);
+# the Polymarket-side keys follow the sibling Polymarket forecast lab's own
+# CLAUDE.md S3 priority-tier vocabulary (economic data & central-bank
+# decisions, weather, long-horizon politics/geopolitics, entertainment/
+# awards). Revise this map once resolve_series_and_category has populated
+# real category strings in data/kmt.db -- do not treat it as final.
+#
+# An R2-side category with no entry here is not an error: control/
+# polymarket.py's build_polymarket_panel leaves `category` as None for any
+# unmapped Polymarket row rather than dropping it -- S2.4's headline monthly
+# psi path is market-wide, not category-interacted, so an incomplete map
+# degrades only a descriptive breakdown, never the headline itself.
+
+version: 1
+
+map:
+  Politics: Politics
+  Elections: Politics
+  Geopolitics: World
+  World: World
+  Economics: Economics
+  Economy: Economics
+  Fed: Economics
+  Inflation: Economics
+  Weather: Climate and Weather
+  Climate: Climate and Weather
+  Entertainment: Entertainment
+  Awards: Entertainment
+  Culture: Culture
+  Science: Science and Technology
+  Technology: Science and Technology
+  Health: Health
+  Sports: Sports
+  # Crypto/equity price-target markets are structurally excluded from both
+  # labs' forecast universes (Claude.md S3 "excluded as structurally
+  # unforecastable" / this repo's own R1/R2 category filters) -- listed here
+  # only so an unmapped Crypto row is a deliberate exclusion, not an
+  # oversight, if it ever reaches this module.
+  Crypto: Crypto

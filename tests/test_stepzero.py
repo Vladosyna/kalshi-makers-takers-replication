@@ -327,6 +327,35 @@ def test_pre_2023_missing_quotes_partial_check5():
 # --- CLI exit codes ------------------------------------------------------------
 
 
+def _write_isolated_config(tmp_path):
+    """A minimal real config.yaml under tmp_path -- load_config()'s default
+    resolves PROJECT_ROOT / "config.yaml" fresh on every call (not a
+    module-level constant frozen at import time), so once PROJECT_ROOT is
+    monkeypatched to tmp_path, a config.yaml must actually exist there."""
+    (tmp_path / "config.yaml").write_text(
+        """
+kalshi:
+  base_url: "https://external-api.kalshi.com/trade-api/v2"
+  rate_limit: { requests_per_second: 10, burst: 20 }
+  known_early_tickers: []
+dates:
+  r1_window: { start: "2021-01-01", end: "2025-04-30" }
+  r2_window: { start: "2025-05-01", end: "2026-06-30" }
+  boundaries: { fee_change: "2025-05-01", publication: "2025-09-08" }
+  r3_window_start: "2026-07-04"
+storage:
+  db_path: data/kmt.db
+  raw_dir: data/raw
+  parquet_dir: data/parquet
+  logs_dir: data/logs
+  reports_dir: reports
+logging:
+  level: INFO
+""",
+        encoding="utf-8",
+    )
+
+
 def test_cli_exits_3_on_auth_required(monkeypatch, tmp_path):
     from kalshi_mt import cli
     from kalshi_mt import util
@@ -343,6 +372,7 @@ def test_cli_exits_3_on_auth_required(monkeypatch, tmp_path):
     # reports/step_zero/ directory -- redirect to an isolated tmp_path.
     monkeypatch.setattr(util, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(report_mod, "PROJECT_ROOT", tmp_path)
+    _write_isolated_config(tmp_path)
 
     runner = CliRunner()
     result = runner.invoke(cli.app, ["step-zero"])
@@ -363,6 +393,7 @@ def test_cli_exits_0_on_clean_success(monkeypatch, tmp_path):
     monkeypatch.setattr(report_mod, "run_step_zero", _fake_run_step_zero)
     monkeypatch.setattr(util, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(report_mod, "PROJECT_ROOT", tmp_path)
+    _write_isolated_config(tmp_path)
 
     runner = CliRunner()
     result = runner.invoke(cli.app, ["step-zero"])

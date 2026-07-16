@@ -19,10 +19,6 @@ from typing import Any, Literal
 
 import yaml
 
-from kalshi_mt.util import PROJECT_ROOT
-
-DEFAULT_FEE_SCHEDULE_PATH = PROJECT_ROOT / "data" / "fees.yaml"
-
 Role = Literal["maker", "taker"]
 
 
@@ -36,7 +32,16 @@ class FeeScheduleGapError(RuntimeError):
 
 
 def load_fee_schedule(path: Path | None = None) -> dict[str, Any]:
-    p = path or DEFAULT_FEE_SCHEDULE_PATH
+    """Defaults to PROJECT_ROOT / "data" / "fees.yaml", resolved via a
+    local import (not a module-level constant) so that test monkeypatching
+    of util.PROJECT_ROOT actually takes effect -- a constant derived once
+    at import time would freeze to whatever PROJECT_ROOT was at first
+    import and silently ignore any later monkeypatch.setattr."""
+    if path is None:
+        from kalshi_mt.util import PROJECT_ROOT
+
+        path = PROJECT_ROOT / "data" / "fees.yaml"
+    p = path
     if not p.exists():
         return {"version": 0, "schedule": []}
     data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}

@@ -19,6 +19,7 @@ invocation rather than needing to complete in one sitting.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -125,27 +126,37 @@ def _trade_row(t: KalshiTrade, ticker: str, source: str) -> dict[str, Any]:
 async def run_pass2(
     client: KalshiClient, conn, trade_store: TradeStore,
     ticker_limit: int | None = None, max_pages_per_market: int | None = None,
+    max_concurrent: int = 20,
 ) -> dict[str, Any]:
     """Fetch full tapes for in-scope markets not yet done. `ticker_limit`
     bounds how many markets this invocation processes (each to completion,
     modulo `max_pages_per_market`) -- pass small values for verification
-    runs rather than the full in-scope set."""
+    runs rather than the full in-scope set.
+
+    Different tickers' fetches run CONCURRENTLY (bounded by
+    `max_concurrent`, sharing the client's TokenBucket) -- same latency-
+    bound finding as fetch/pass1.py's discovery phases. Safe with respect
+    to TradeStore.append's own read-modify-write on a shared Parquet
+    partition: append() has no internal `await`, so under asyncio's
+    single-threaded cooperative scheduling one call always runs to
+    completion before another coroutine's code can execute -- there is no
+    point where two concurrent tickers' writes can interleave mid-operation."""
     tickers = select_in_scope_tickers(conn)
     if ticker_limit is not None:
         tickers = tickers[:ticker_limit]
 
     log_id = db.log_fetch(conn, "pass2", f"{len(tickers)} tickers", "in_progress")
-    results = []
-    total_trades = 0
-    done_count = 0
-    for ticker in tickers:
-        result = await fetch_full_tape_for_market(
-            client, conn, trade_store, ticker, max_pages=max_pages_per_market
-        )
-        results.append(result)
-        total_trades += result["trade_count"]
-        if result["status"] == "done":
-            done_count += 1
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def _fetch_one(ticker: str) -> dict[str, Any]:
+        async with semaphore:
+            return await fetch_full_tape_for_market(
+                client, conn, trade_store, ticker, max_pages=max_pages_per_market
+            )
+
+    results = await asyncio.gather(*[_fetch_one(t) for t in tickers])
+    total_trades = sum(r["trade_count"] for r in results)
+    done_count = sum(1 for r in results if r["status"] == "done")
 
     db.finish_fetch_log(
         conn, log_id, "done", fetched_count=total_trades,

@@ -9,13 +9,18 @@ kalshi:
   # than trusting the docs alone (guardrail: verify, don't infer).
   base_url: "https://external-api.kalshi.com/trade-api/v2"
   rate_limit:
-    # Spec S3 pins "<=5 req/s sustained" explicitly for the fetch pipeline;
-    # applied here too since Kalshi's public/unauthenticated rate limit is
-    # UNDOCUMENTED (only authenticated tiers are published) -- conservative
-    # by design, not copied from the sibling lab's 8 req/s (that number was
-    # tuned for a different cadence/purpose).
-    requests_per_second: 5
-    burst: 10
+    # Raised 2026-07-16 to Kalshi's own documented ceiling (spec S3: "<=5
+    # req/s sustained, documented ceiling ~10") for the real collection
+    # run -- this is the maximum polite rate, not an override of it: going
+    # higher risks 429s, which cost more in backoff than staying at the
+    # ceiling ever saves. Kalshi's public/unauthenticated limit is itself
+    # undocumented (only authenticated tiers are published), so 10 is our
+    # own read of "the ceiling," not a number Kalshi states for this tier.
+    # Deliberately run ONE fetch process at a time against this budget --
+    # pass1 and pass2 each open their own TokenBucket, so running both
+    # concurrently would double the effective rate past the ceiling.
+    requests_per_second: 10
+    burst: 20
   # Step Zero's own discovery step finds these; ships empty since real
   # tickers aren't known until Step Zero runs. Once found, worth pinning
   # here so reruns are deterministic instead of re-discovering a (possibly

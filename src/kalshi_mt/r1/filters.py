@@ -39,19 +39,25 @@ def _implied_side(yes_price: float | None) -> str | None:
     return "yes" if yes_price >= 0.5 else "no"
 
 
-def apply_r1_filters(conn) -> list[FilterResult]:
-    """One row per R1-window market that Pass 1 has reached at least once
-    (has a markets row). A market with no quote row yet is reported as
+def apply_r1_filters(conn, window: str = "r1") -> list[FilterResult]:
+    """One row per market in the given window (`in_r1_window` or
+    `in_r2_window`) that Pass 1 has reached at least once (has a markets
+    row). Same filter thresholds for both windows -- analysis_plan.md S2's
+    R2 spec is described as an extension of R1's own construction, with no
+    separate filter definition restated, so R2 reuses R1's volume/spread/
+    duration/settlement-mismatch criteria unchanged, applied to the R2
+    window's markets. A market with no quote row yet is reported as
     failing on 'no_quote_available' -- not silently skipped -- since
     incomplete Pass 1 coverage should be visible in the reconciliation
     counts, not swallowed."""
+    window_column = {"r1": "in_r1_window", "r2": "in_r2_window"}[window]
     rows = conn.execute(
-        """
+        f"""
         SELECT m.ticker, m.volume_fp, m.open_time_epoch, m.close_time_epoch, m.result,
                q.spread
         FROM markets m
         LEFT JOIN quotes q ON q.ticker = m.ticker
-        WHERE m.in_r1_window = 1
+        WHERE m.{window_column} = 1
         """
     ).fetchall()
 
@@ -96,7 +102,7 @@ def apply_and_log(conn, window: str = "r1") -> dict[str, Any]:
     """Runs the filters and persists every exclusion to universe_log
     (spec-wide defense against selection-bias claims -- see db.py's own
     universe_log docstring)."""
-    results = apply_r1_filters(conn)
+    results = apply_r1_filters(conn, window=window)
     exclusions = [
         (r.ticker, code) for r in results if not r.passed for code in r.reason_codes
     ]

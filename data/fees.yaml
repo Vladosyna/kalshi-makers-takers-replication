@@ -1,0 +1,78 @@
+# Kalshi fee history -- primary-artifact sourced (spec S3), right-continuous
+# step function keyed on trade FILL timestamp (never seeded from a "current"
+# row backwards -- see fees/schedule.py's lookup for the enforcement).
+#
+# Formula (both roles, both eras): fee_usd = ceil_to_cent(rate * C * P * (1-P))
+# where C = contract count in the fill, P = Yes price in dollars. The ceiling
+# applies to the ORDER TOTAL (C contracts at once), not per-contract -- BDW's
+# own paper: "$0.07*P(1-P) per contract, total rounded up to the next cent."
+# Their own "~1.77% at 50c" figure is an illustration on a C=100 order, not
+# the formula itself -- see fees/schedule.py's fee_usd_for docstring.
+#
+# Sources:
+#
+# TAKER (rate=0.07, all eras, all categories):
+#   BDW's own paper, Section on data construction: "$0.07*P(1-P) per
+#   contract" -- this repo's replication target formula by definition, and
+#   independently confirmed live via Kalshi's own published fee schedule
+#   (kalshi.com/fee-schedule; corroborated by whirligigbear.substack.com's
+#   independent technical breakdown, 2025-09-17: "0.07 * P * (1-P)",
+#   "maximum taker fee ... at 50c, equaling 1.75c per contract"). Effective
+#   date 2022-09-22 is Kalshi's ORIGINAL CFTC-filed fee schedule
+#   (cftc.gov/sites/default/files/filings/orgrules/22/09/rule091222kexdcm003.pdf,
+#   "Kalshi Fee Schedule.docx", filed alongside a companion redline
+#   rule091222kexdcm002.pdf) -- no evidence found of a taker-rate revision
+#   between then and BDW's own April-2025 sample cutoff, consistent with
+#   BDW treating 0.07 as a single constant across their entire 2021-2025
+#   window.
+#
+# MAKER pre-2025-05-01 (rate=0.0, all categories):
+#   BDW's own paper, verbatim: "Kalshi began to charge fees on Makers after
+#   April 2025" -- i.e. zero before that. This is the paper's own dating of
+#   its sample cutoff, which this repo's spec (Claude.md S1) already
+#   inherits as the R1/R2 boundary (2025-05-01).
+#
+# MAKER from 2025-05-01 (rate=0.0175, all categories):
+#   Rate: multi-source confirmed at 25% of the taker rate --
+#   "Kalshi maker fees are calculated as round_up(0.0175 * C * P * (1-P))"
+#   (multiple independent web sources, 2026 vintage, converged
+#   independently on the same 0.0175 figure and the "25% of taker" framing).
+#   Also matches a comment already present in the sibling polymarket-forecast-lab's
+#   own data/fee_schedule.yaml (sourced there from kalshi.com/fee-schedule as
+#   of 2026-07-07): "maker fee (rests on the book) is 25% of that [taker]".
+#
+#   [VERIFY] Effective date: set here to 2025-05-01 on the strength of BDW's
+#   own "after April 2025" dating, corroborated by a CFTC self-certification
+#   filing titled "description and terms of kalshi's 2025 market maker
+#   program" submitted 2025-04-21
+#   (cftc.gov/filings/orgrules/rules04212519494.pdf) -- self-certified rule
+#   changes typically take effect on a stated date shortly after filing,
+#   consistent with a program submitted 2025-04-21 taking effect in May
+#   2025. This is NOT a verbatim date read off the filing's own effective-
+#   date field: the filing is a compressed/encoded PDF that every available
+#   extraction tool in this environment (WebFetch's summarizer, the PDF
+#   viewer MCP, `strings` against the raw bytes) failed to render as
+#   readable text. Before this fee row is used for any real R2 net-of-cost
+#   number, re-verify the exact effective date directly against the filing
+#   (a human opening the PDF, or a proper PDF-text-extraction pass) --
+#   flagged explicitly per spec S3's own warning that this file is the
+#   single most error-prone input in the whole replication.
+#
+#   No evidence of a LATER maker-rate revision (2025-05-01 -> present) was
+#   found in this research pass; only one maker row exists below. This is a
+#   documented absence-of-evidence, not a claim that no later revision
+#   exists -- re-check before relying on it for the R2 window's later months.
+version: 1
+schedule:
+  - effective_from: "2022-09-22"
+    role: taker
+    category: default
+    rate: 0.07
+  - effective_from: "2022-09-22"
+    role: maker
+    category: default
+    rate: 0.0
+  - effective_from: "2025-05-01"
+    role: maker
+    category: default
+    rate: 0.0175

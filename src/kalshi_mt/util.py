@@ -15,7 +15,6 @@ from zoneinfo import ZoneInfo
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 
 # Spec S3: "all 'same time' comparisons in US Eastern Time." zoneinfo (not a
 # fixed offset, not pytz) is required here specifically because DST-correct
@@ -90,7 +89,13 @@ def now_utc_iso() -> str:
 
 
 def load_config(path: Path | None = None) -> dict[str, Any]:
-    config_path = path or DEFAULT_CONFIG_PATH
+    """Defaults to PROJECT_ROOT / "config.yaml", resolved fresh on every
+    call (a plain reference to the module-global PROJECT_ROOT, not a
+    separately-cached constant) so that test monkeypatching of
+    util.PROJECT_ROOT actually takes effect -- a constant derived once at
+    import time would freeze to whatever PROJECT_ROOT was at first import
+    and silently ignore any later monkeypatch.setattr."""
+    config_path = path or (PROJECT_ROOT / "config.yaml")
     with open(config_path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 

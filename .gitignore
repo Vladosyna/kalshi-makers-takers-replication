@@ -2,10 +2,27 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-data/
+# `data/*` (not `data/`) deliberately -- a bare directory-ignore prunes the
+# whole tree during traversal, so file-level negations below would never
+# even be evaluated (git's documented gotcha: "it is not possible to
+# re-include a file if a parent directory of that file is excluded"). The
+# glob form ignores each entry individually, which negation can override.
+data/*
 !data/.gitkeep
+!data/logs/
+data/logs/*
 !data/logs/.gitkeep
+# Versioned, pre-registration-relevant artifacts -- committed deliberately,
+# same tier as reports/step_zero/ below. Everything else under data/
+# (kmt.db, raw fetch output, parquet snapshots, the HF bootstrap download)
+# stays gitignored: runtime state and large binary data, not source.
+!data/fees.yaml
+!data/frozen_2024_mix.json
+!data/category_map_polymarket_kalshi.yaml
 reports/*
 !reports/.gitkeep
 !reports/step_zero/
+!reports/r1/
+!reports/r2/
+!reports/final/
 .env

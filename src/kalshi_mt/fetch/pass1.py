@@ -30,6 +30,7 @@ spread filter.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -84,27 +85,58 @@ def _market_to_row(m: KalshiMarket, source: str) -> dict[str, Any]:
 
 async def discover_live_window(
     client: KalshiClient, conn, start_ts: int = LIVE_METADATA_FLOOR, end_ts: int = R2_END,
-    page_limit: int = 1000, max_pages: int | None = None,
+    page_limit: int = 1000, max_pages: int | None = None, n_concurrent_windows: int = 8,
 ) -> dict[str, int]:
+    """Splits [start_ts, end_ts] into `n_concurrent_windows` non-overlapping
+    sub-windows and walks each sub-window's cursor pagination CONCURRENTLY
+    (all sharing the same TokenBucket via `client`, so the aggregate
+    request rate still respects the configured ceiling -- concurrency
+    changes how many requests are IN FLIGHT, not the per-second budget).
+
+    This exists because of a real, measured bottleneck: a single sequential
+    cursor walk is LATENCY-bound, not rate-bound -- confirmed live,
+    2026-07-16, a run configured for 10 req/s sustained only ~3 req/s
+    because each request waited for the previous one's full round trip
+    before the next could even be attempted. Cursor pagination is
+    inherently sequential WITHIN one sub-window (page N+1 needs page N's
+    cursor), so the concurrency here comes from running several
+    INDEPENDENT sub-window walks side by side, not from parallelizing pages
+    within a single walk."""
     log_id = db.log_fetch(conn, "pass1_discovery_live", f"{start_ts}-{end_ts}", "in_progress")
-    cursor: str | None = None
-    fetched = 0
-    pages = 0
-    while True:
-        markets, next_cursor = await client.list_markets(
-            min_close_ts=start_ts, max_close_ts=end_ts, cursor=cursor, limit=page_limit
-        )
-        for m in markets:
-            db.upsert_market(conn, _market_to_row(m, "live"))
-        fetched += len(markets)
-        conn.commit()
-        pages += 1
-        if not next_cursor or not markets:
-            break
-        cursor = next_cursor
-        if max_pages is not None and pages >= max_pages:
-            break
-    db.finish_fetch_log(conn, log_id, "done", fetched_count=fetched, notes=f"{pages} pages")
+
+    span = end_ts - start_ts
+    step = max(span // n_concurrent_windows, 1)
+    boundaries = [start_ts + i * step for i in range(n_concurrent_windows)] + [end_ts]
+    sub_windows = [(boundaries[i], boundaries[i + 1]) for i in range(n_concurrent_windows)]
+
+    async def _walk_subwindow(sub_start: int, sub_end: int) -> tuple[int, int]:
+        cursor: str | None = None
+        fetched = 0
+        pages = 0
+        while True:
+            markets, next_cursor = await client.list_markets(
+                min_close_ts=sub_start, max_close_ts=sub_end, cursor=cursor, limit=page_limit
+            )
+            for m in markets:
+                db.upsert_market(conn, _market_to_row(m, "live"))
+            fetched += len(markets)
+            conn.commit()
+            pages += 1
+            if not next_cursor or not markets:
+                break
+            cursor = next_cursor
+            if max_pages is not None and pages >= max_pages:
+                break
+        return fetched, pages
+
+    results = await asyncio.gather(*[_walk_subwindow(s, e) for s, e in sub_windows])
+    fetched = sum(r[0] for r in results)
+    pages = sum(r[1] for r in results)
+
+    db.finish_fetch_log(
+        conn, log_id, "done", fetched_count=fetched,
+        notes=f"{pages} pages across {n_concurrent_windows} concurrent sub-windows",
+    )
     conn.commit()
     return {"fetched": fetched, "pages": pages}
 
@@ -114,7 +146,14 @@ async def discover_live_window(
 async def discover_historical_series(
     client: KalshiClient, conn, start_ts: int = R1_START, end_ts: int = LIVE_METADATA_FLOOR,
     max_series_this_run: int | None = None, max_pages_per_series: int = 20,
+    max_concurrent_series: int = 20,
 ) -> dict[str, int]:
+    """Different series are fully independent -- their cursor walks run
+    CONCURRENTLY, bounded by `max_concurrent_series` (same latency-bound
+    finding as discover_live_window and resolve_series_and_category: a
+    sequential per-series loop sat well below the configured rate
+    ceiling). Pagination WITHIN one series stays sequential (page N+1
+    needs page N's cursor)."""
     all_series = await client.list_series(limit=100_000)  # /series has no real limit param; client-truncates
     for s in all_series:
         if db.get_series_scan_state(conn, s.ticker) is None:
@@ -131,45 +170,49 @@ async def discover_historical_series(
     if max_series_this_run is not None:
         pending = pending[:max_series_this_run]
 
-    series_processed = 0
-    markets_found_total = 0
-    for row in pending:
-        ticker, cursor, pages_so_far = row["series_ticker"], row["last_cursor"], row["pages_fetched"]
-        found_in_series = 0
-        reached_before = False
-        for _ in range(max_pages_per_series):
-            markets, next_cursor = await client.list_historical_markets(
-                series_ticker=ticker, cursor=cursor, limit=1000
-            )
-            pages_so_far += 1
-            if not markets:
-                break
-            close_epochs: list[int] = []
-            for m in markets:
-                row_dict = _market_to_row(m, "historical")
-                ce = row_dict["close_time_epoch"]
-                if ce is not None:
-                    close_epochs.append(ce)
-                if ce is not None and start_ts <= ce < end_ts:
-                    db.upsert_market(conn, row_dict)
-                    found_in_series += 1
-            # Pages are reverse-chronological (empirically confirmed, Phase 1):
-            # once a page's newest row already predates the window, every
-            # later page for this series is even older.
-            if close_epochs and max(close_epochs) < start_ts:
-                reached_before = True
-                break
-            if not next_cursor:
-                break
-            cursor = next_cursor
-        db.upsert_series_scan_state(conn, {
-            "series_ticker": ticker, "status": "done", "pages_fetched": pages_so_far,
-            "markets_found_in_window": found_in_series,
-            "reached_before_window": int(reached_before), "last_cursor": cursor,
-        })
-        conn.commit()
-        series_processed += 1
-        markets_found_total += found_in_series
+    semaphore = asyncio.Semaphore(max_concurrent_series)
+
+    async def _scan_series(row) -> int:
+        async with semaphore:
+            ticker, cursor, pages_so_far = row["series_ticker"], row["last_cursor"], row["pages_fetched"]
+            found_in_series = 0
+            reached_before = False
+            for _ in range(max_pages_per_series):
+                markets, next_cursor = await client.list_historical_markets(
+                    series_ticker=ticker, cursor=cursor, limit=1000
+                )
+                pages_so_far += 1
+                if not markets:
+                    break
+                close_epochs: list[int] = []
+                for m in markets:
+                    row_dict = _market_to_row(m, "historical")
+                    ce = row_dict["close_time_epoch"]
+                    if ce is not None:
+                        close_epochs.append(ce)
+                    if ce is not None and start_ts <= ce < end_ts:
+                        db.upsert_market(conn, row_dict)
+                        found_in_series += 1
+                # Pages are reverse-chronological (empirically confirmed,
+                # Phase 1): once a page's newest row already predates the
+                # window, every later page for this series is even older.
+                if close_epochs and max(close_epochs) < start_ts:
+                    reached_before = True
+                    break
+                if not next_cursor:
+                    break
+                cursor = next_cursor
+            db.upsert_series_scan_state(conn, {
+                "series_ticker": ticker, "status": "done", "pages_fetched": pages_so_far,
+                "markets_found_in_window": found_in_series,
+                "reached_before_window": int(reached_before), "last_cursor": cursor,
+            })
+            conn.commit()
+            return found_in_series
+
+    per_series_found = await asyncio.gather(*[_scan_series(row) for row in pending])
+    series_processed = len(pending)
+    markets_found_total = sum(per_series_found)
 
     remaining = conn.execute(
         "SELECT COUNT(*) FROM series_scan_state WHERE status IN ('pending', 'in_progress')"
@@ -185,25 +228,52 @@ async def discover_historical_series(
 
 async def resolve_series_and_category(
     client: KalshiClient, conn, batch_size: int | None = 500,
+    min_volume_fp: float | None = None, max_concurrent: int = 20,
 ) -> dict[str, int]:
+    """`min_volume_fp` restricts resolution to markets that could plausibly
+    clear R1/R2's own $1k volume filter (fetch/pass2.py's MIN_VOLUME_FP) --
+    a live sweep across the full R1+R2 window can discover many hundreds of
+    thousands of markets (most of them thin sports/crypto sub-markets that
+    will never survive Phase 3's filters), and every resolution is one
+    GET /events call. Filtering here, not just at Pass 2's in-scope
+    selection, is what keeps a real collection run from spending days
+    resolving series/category for markets no downstream phase will ever use.
+
+    The GET /events calls for distinct event_tickers run CONCURRENTLY
+    (bounded by `max_concurrent`, sharing the client's TokenBucket) -- one
+    sequential await-per-call loop was confirmed live to be latency-bound
+    well below the configured rate ceiling (fetch/pass1.py's
+    discover_live_window docstring has the same finding). The dedup-by-
+    event_ticker caching happens in a first pass (collect the unique set,
+    resolve it concurrently) so no event is ever fetched twice even though
+    many tickers can share one event_ticker."""
     all_series = await client.list_series(limit=100_000)
     category_by_series = {s.ticker: s.category for s in all_series}
 
-    rows = conn.execute(
-        "SELECT ticker, event_ticker FROM markets "
-        "WHERE series_ticker IS NULL AND event_ticker IS NOT NULL"
-    ).fetchall()
+    query = "SELECT ticker, event_ticker FROM markets WHERE series_ticker IS NULL AND event_ticker IS NOT NULL"
+    params: list[Any] = []
+    if min_volume_fp is not None:
+        query += " AND volume_fp >= ?"
+        params.append(min_volume_fp)
+    rows = conn.execute(query, params).fetchall()
     if batch_size is not None:
         rows = rows[:batch_size]
 
-    event_cache: dict[str, str | None] = {}
+    unique_events = list({row["event_ticker"] for row in rows})
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def _fetch_event(event_ticker: str) -> tuple[str, str | None]:
+        async with semaphore:
+            event = await client.get_event(event_ticker)
+            return event_ticker, (event.series_ticker if event else None)
+
+    resolved_events = await asyncio.gather(*[_fetch_event(e) for e in unique_events])
+    event_cache: dict[str, str | None] = dict(resolved_events)
+
     resolved = 0
     for row in rows:
         ticker, event_ticker = row["ticker"], row["event_ticker"]
-        if event_ticker not in event_cache:
-            event = await client.get_event(event_ticker)
-            event_cache[event_ticker] = event.series_ticker if event else None
-        series_ticker = event_cache[event_ticker]
+        series_ticker = event_cache.get(event_ticker)
         if series_ticker is None:
             continue
         conn.execute(
@@ -212,9 +282,12 @@ async def resolve_series_and_category(
         )
         resolved += 1
     conn.commit()
-    remaining = conn.execute(
-        "SELECT COUNT(*) FROM markets WHERE series_ticker IS NULL AND event_ticker IS NOT NULL"
-    ).fetchone()[0]
+    remaining_query = "SELECT COUNT(*) FROM markets WHERE series_ticker IS NULL AND event_ticker IS NOT NULL"
+    remaining_params: list[Any] = []
+    if min_volume_fp is not None:
+        remaining_query += " AND volume_fp >= ?"
+        remaining_params.append(min_volume_fp)
+    remaining = conn.execute(remaining_query, remaining_params).fetchone()[0]
     return {"resolved_this_run": resolved, "remaining": remaining}
 
 
@@ -333,6 +406,8 @@ async def run_pass1(
     market_processing_limit: int | None = None,
     live_max_pages: int | None = None,
     series_resolution_batch_size: int | None = 500,
+    min_volume_fp: float | None = 1000.0,
+    panel_quote_concurrency: int = 20,
 ) -> dict[str, Any]:
     """Discovery (live sweep + historical series scan) -> series/category
     resolution -> price-panel + closing-quote fetch for every discovered
@@ -340,35 +415,66 @@ async def run_pass1(
     small `max_series_this_run`/`market_processing_limit`/`live_max_pages`
     values to bound a single invocation (verification, a scheduled
     incremental run) rather than the full multi-hour sweep. The live sweep
-    alone can touch tens of thousands of markets across the full R1+R2
-    window (spec's own ~50-80k-market estimate) -- `live_max_pages` is what
-    keeps a verification run from silently turning into a near-production
-    one; omit it only when you actually intend the full sweep."""
+    alone can touch HUNDREDS of thousands of markets across the full R1+R2
+    window (confirmed live, 2026-07: 576k+ from the live sweep phase alone,
+    well past the spec's own ~50-80k planning estimate) -- `live_max_pages`
+    is what keeps a verification run from silently turning into a
+    near-production one; omit it only when you actually intend the full
+    sweep.
+
+    `min_volume_fp` defaults to fetch/pass2.py's own $1k R1/R2 volume
+    filter and restricts BOTH series/category resolution and the
+    panel+quote fetch to markets that could plausibly clear it -- the
+    great majority of a full live sweep is thin sports/crypto sub-markets
+    that will never survive Phase 3's filters, and each is ~1-13 extra API
+    calls (one /events lookup, up to 11 boundary-tick trade lookups, one
+    candlestick lookup) if not filtered here. Metadata discovery itself
+    (this function's first two sub-phases) is NEVER volume-filtered --
+    every market's basic record lands in `markets` regardless, so
+    universe_log/reconciliation coverage stays complete; only the
+    EXPENSIVE per-market detail work is scoped down. Pass None to disable
+    (process every discovered market) if a specific verification run
+    genuinely needs that."""
     live_stats = await discover_live_window(client, conn, max_pages=live_max_pages)
     hist_stats = await discover_historical_series(
         client, conn, max_series_this_run=max_series_this_run
     )
     resolve_stats = await resolve_series_and_category(
-        client, conn, batch_size=series_resolution_batch_size
+        client, conn, batch_size=series_resolution_batch_size, min_volume_fp=min_volume_fp
     )
 
-    rows = conn.execute(
+    query = (
         "SELECT ticker, event_ticker, close_time_epoch FROM markets "
         "WHERE close_time_epoch IS NOT NULL "
         "AND ticker NOT IN (SELECT ticker FROM price_panel)"
-    ).fetchall()
+    )
+    params: list[Any] = []
+    if min_volume_fp is not None:
+        query += " AND volume_fp >= ?"
+        params.append(min_volume_fp)
+    rows = conn.execute(query, params).fetchall()
     if market_processing_limit is not None:
         rows = rows[:market_processing_limit]
 
-    panel_written = 0
-    quotes_written = 0
-    for row in rows:
-        panel_result = await fetch_price_panel(client, conn, row["ticker"], row["close_time_epoch"])
-        panel_written += panel_result["rows_written"]
-        quote_result = await fetch_closing_quote(
-            client, conn, row["ticker"], row["event_ticker"], row["close_time_epoch"]
-        )
-        quotes_written += int(quote_result["has_quote"])
+    # Concurrent, bounded panel+quote fetch -- each market's ~12-13 calls
+    # (up to 11 boundary-tick trade lookups + one candlestick lookup) were
+    # confirmed live to be latency-bound in a sequential loop, same finding
+    # as discover_live_window's own docstring. Different markets are fully
+    # independent, so this is safe to parallelize (unlike cursor pagination
+    # within one market, which stays sequential inside fetch_price_panel).
+    panel_quote_semaphore = asyncio.Semaphore(panel_quote_concurrency)
+
+    async def _process_market(row) -> tuple[int, int]:
+        async with panel_quote_semaphore:
+            panel_result = await fetch_price_panel(client, conn, row["ticker"], row["close_time_epoch"])
+            quote_result = await fetch_closing_quote(
+                client, conn, row["ticker"], row["event_ticker"], row["close_time_epoch"]
+            )
+            return panel_result["rows_written"], int(quote_result["has_quote"])
+
+    per_market_results = await asyncio.gather(*[_process_market(row) for row in rows])
+    panel_written = sum(r[0] for r in per_market_results)
+    quotes_written = sum(r[1] for r in per_market_results)
 
     return {
         "live_discovery": live_stats,

@@ -31,31 +31,42 @@ def _market(ticker: str, close_epoch: int, event_ticker: str = "EVT-1", status: 
 # ---------------------------------------------------------------------------
 
 class _FakeLiveDiscoveryClient:
-    """Two pages then an empty cursor."""
+    """Keyed by (min_close_ts, max_close_ts) so each concurrent sub-window
+    (discover_live_window splits its range into n_concurrent_windows
+    independent cursor walks) gets its own page sequence, matching how a
+    real API scopes pagination to the query's own filter bounds -- a
+    single shared call-index counter would incorrectly interleave
+    concurrent lanes."""
 
-    def __init__(self, pages):
-        self.pages = pages
-        self.calls = []
+    def __init__(self, pages_by_window):
+        self.pages_by_window = pages_by_window  # {(min_ts, max_ts): [(markets, cursor), ...]}
+        self.calls_per_window: dict[tuple, list] = {}
 
     async def list_markets(self, status=None, min_close_ts=None, max_close_ts=None,
                             min_settled_ts=None, max_settled_ts=None, series_ticker=None,
                             event_ticker=None, cursor=None, limit=100):
-        self.calls.append(cursor)
-        idx = len(self.calls) - 1
-        if idx >= len(self.pages):
+        key = (min_close_ts, max_close_ts)
+        calls = self.calls_per_window.setdefault(key, [])
+        calls.append(cursor)
+        idx = len(calls) - 1
+        pages = self.pages_by_window.get(key, [])
+        if idx >= len(pages):
             return [], None
-        return self.pages[idx]
+        return pages[idx]
 
 
 def test_discover_live_window_paginates_and_flags_windows(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     r1_epoch = pass1.R1_START + 86400  # inside R1
     r2_epoch = pass1.R2_START + 86400  # inside R2
-    client = _FakeLiveDiscoveryClient([
-        ([_market("A-1", r1_epoch)], "cursor2"),
-        ([_market("B-1", r2_epoch)], None),
-    ])
-    stats = asyncio.run(pass1.discover_live_window(client, conn, page_limit=1000))
+    window_key = (pass1.LIVE_METADATA_FLOOR, pass1.R2_END)
+    client = _FakeLiveDiscoveryClient({
+        window_key: [
+            ([_market("A-1", r1_epoch)], "cursor2"),
+            ([_market("B-1", r2_epoch)], None),
+        ],
+    })
+    stats = asyncio.run(pass1.discover_live_window(client, conn, page_limit=1000, n_concurrent_windows=1))
     assert stats["fetched"] == 2
     assert stats["pages"] == 2
     a = conn.execute("SELECT in_r1_window, in_r2_window FROM markets WHERE ticker='A-1'").fetchone()
@@ -66,14 +77,38 @@ def test_discover_live_window_paginates_and_flags_windows(tmp_path):
 
 def test_discover_live_window_respects_max_pages(tmp_path):
     conn = db.connect(tmp_path / "t.db")
-    client = _FakeLiveDiscoveryClient([
-        ([_market("A-1", pass1.R1_START)], "c2"),
-        ([_market("B-1", pass1.R1_START)], "c3"),
-        ([_market("C-1", pass1.R1_START)], None),
-    ])
-    stats = asyncio.run(pass1.discover_live_window(client, conn, max_pages=1))
+    window_key = (pass1.LIVE_METADATA_FLOOR, pass1.R2_END)
+    client = _FakeLiveDiscoveryClient({
+        window_key: [
+            ([_market("A-1", pass1.R1_START)], "c2"),
+            ([_market("B-1", pass1.R1_START)], "c3"),
+            ([_market("C-1", pass1.R1_START)], None),
+        ],
+    })
+    stats = asyncio.run(pass1.discover_live_window(client, conn, max_pages=1, n_concurrent_windows=1))
     assert stats["pages"] == 1
-    assert stats["fetched"] == 1
+
+
+def test_discover_live_window_splits_into_concurrent_subwindows(tmp_path):
+    """Each of N sub-windows gets its OWN independent cursor walk -- total
+    fetched is the sum across all lanes, not just the first one."""
+    conn = db.connect(tmp_path / "t.db")
+    start_ts, end_ts = 0, 1000
+    n_windows = 4
+    step = (end_ts - start_ts) // n_windows
+    boundaries = [start_ts + i * step for i in range(n_windows)] + [end_ts]
+    pages_by_window = {}
+    for i in range(n_windows):
+        key = (boundaries[i], boundaries[i + 1])
+        pages_by_window[key] = [([_market(f"M{i}", boundaries[i])], None)]
+
+    client = _FakeLiveDiscoveryClient(pages_by_window)
+    stats = asyncio.run(pass1.discover_live_window(
+        client, conn, start_ts=start_ts, end_ts=end_ts, n_concurrent_windows=n_windows
+    ))
+    assert stats["fetched"] == n_windows  # one market discovered per sub-window
+    tickers = {r[0] for r in conn.execute("SELECT ticker FROM markets").fetchall()}
+    assert tickers == {f"M{i}" for i in range(n_windows)}
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +210,27 @@ def test_resolve_series_and_category_backfills_and_caches_events(tmp_path):
     row = conn.execute("SELECT series_ticker, category FROM markets WHERE ticker='A-1'").fetchone()
     assert row[0] == "KXHIGHNY"
     assert row[1] == "Climate and Weather"
+
+
+def test_resolve_series_and_category_min_volume_filters_thin_markets(tmp_path):
+    """A live sweep across R1+R2 can discover hundreds of thousands of thin
+    markets that will never clear Phase 3's $1k volume filter -- confirmed
+    live, 2026-07. min_volume_fp keeps resolve_series_and_category (one
+    GET /events call per unresolved market) from spending API budget on
+    markets no downstream phase will ever use."""
+    conn = db.connect(tmp_path / "t.db")
+    db.upsert_market(conn, {"ticker": "THICK", "event_ticker": "EVT-1", "volume_fp": 5000.0})
+    db.upsert_market(conn, {"ticker": "THIN", "event_ticker": "EVT-1", "volume_fp": 10.0})
+    conn.commit()
+
+    client = _FakeResolveClient()
+    stats = asyncio.run(pass1.resolve_series_and_category(client, conn, min_volume_fp=1000.0))
+    assert stats["resolved_this_run"] == 1
+
+    thick = conn.execute("SELECT series_ticker FROM markets WHERE ticker='THICK'").fetchone()
+    thin = conn.execute("SELECT series_ticker FROM markets WHERE ticker='THIN'").fetchone()
+    assert thick[0] == "KXHIGHNY"
+    assert thin[0] is None
 
 
 # ---------------------------------------------------------------------------
@@ -305,3 +361,72 @@ def test_fetch_closing_quote_no_quote_anywhere(tmp_path):
     result = asyncio.run(pass1.fetch_closing_quote(client, conn, "A-1", "EVT-1", 2000))
     assert result["has_quote"] is False
     assert conn.execute("SELECT COUNT(*) FROM quotes").fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# run_pass1 -- min_volume_fp restricts the expensive per-market phases
+# ---------------------------------------------------------------------------
+
+class _NoOpDiscoveryClient:
+    """Empty responses for every discovery call -- no NEW markets appear --
+    so a run_pass1 test can focus purely on how it treats PRE-SEEDED
+    markets during the panel/quote phase, tracking which tickers actually
+    get a get_trades call (the expensive part min_volume_fp guards)."""
+
+    def __init__(self):
+        self.trade_fetch_calls: list[str] = []
+        self.event_calls: list[str] = []
+
+    async def list_markets(self, **kwargs):
+        return [], None
+
+    async def list_series(self, category=None, limit=200):
+        return []
+
+    async def list_historical_markets(self, **kwargs):
+        return [], None
+
+    async def get_event(self, event_ticker):
+        self.event_calls.append(event_ticker)
+        return None
+
+    async def get_trades(self, ticker=None, min_ts=None, max_ts=None, cursor=None, limit=100):
+        self.trade_fetch_calls.append(ticker)
+        return [], None
+
+    async def get_historical_trades(self, ticker=None, min_ts=None, max_ts=None, cursor=None, limit=100):
+        return [], None
+
+    async def get_candlesticks(self, series_ticker, ticker, start_ts, end_ts, period_interval=1440):
+        return []
+
+    async def get_historical_candlesticks(self, ticker, start_ts, end_ts, period_interval=1440):
+        return []
+
+
+def test_run_pass1_default_min_volume_skips_thin_markets_panel_quote_fetch(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    db.upsert_market(conn, {"ticker": "THICK", "close_time_epoch": 1000, "volume_fp": 5000.0})
+    db.upsert_market(conn, {"ticker": "THIN", "close_time_epoch": 1000, "volume_fp": 10.0})
+    conn.commit()
+
+    client = _NoOpDiscoveryClient()
+    stats = asyncio.run(pass1.run_pass1(client, conn, max_series_this_run=0))
+
+    assert "THICK" in client.trade_fetch_calls
+    assert "THIN" not in client.trade_fetch_calls
+    assert stats["markets_processed"] == 1
+
+
+def test_run_pass1_min_volume_none_processes_every_market(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    db.upsert_market(conn, {"ticker": "THICK", "close_time_epoch": 1000, "volume_fp": 5000.0})
+    db.upsert_market(conn, {"ticker": "THIN", "close_time_epoch": 1000, "volume_fp": 10.0})
+    conn.commit()
+
+    client = _NoOpDiscoveryClient()
+    stats = asyncio.run(pass1.run_pass1(client, conn, max_series_this_run=0, min_volume_fp=None))
+
+    assert "THICK" in client.trade_fetch_calls
+    assert "THIN" in client.trade_fetch_calls
+    assert stats["markets_processed"] == 2
