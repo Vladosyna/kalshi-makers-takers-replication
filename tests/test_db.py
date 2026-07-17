@@ -120,6 +120,22 @@ def test_series_scan_state_roundtrip(tmp_path):
     assert row["pages_fetched"] == 3
 
 
+def test_live_window_scan_state_roundtrip(tmp_path):
+    conn = db.connect(tmp_path / "test.db")
+    assert db.get_live_window_scan_state(conn, 1000, 2000) is None
+    db.upsert_live_window_scan_state(conn, {
+        "window_start": 1000, "window_end": 2000, "status": "in_progress",
+        "cursor": "abc", "fetched_count": 40, "pages_fetched": 4,
+    })
+    conn.commit()
+    row = db.get_live_window_scan_state(conn, 1000, 2000)
+    assert row["status"] == "in_progress"
+    assert row["cursor"] == "abc"
+    assert row["fetched_count"] == 40
+    # A different (window_start, window_end) key is a distinct checkpoint.
+    assert db.get_live_window_scan_state(conn, 2000, 3000) is None
+
+
 def test_pass2_progress_roundtrip(tmp_path):
     conn = db.connect(tmp_path / "test.db")
     db.upsert_market(conn, {"ticker": "ABC-1"})

@@ -101,7 +101,18 @@ async def discover_live_window(
     inherently sequential WITHIN one sub-window (page N+1 needs page N's
     cursor), so the concurrency here comes from running several
     INDEPENDENT sub-window walks side by side, not from parallelizing pages
-    within a single walk."""
+    within a single walk.
+
+    Each sub-window's cursor is checkpointed in live_window_scan_state
+    (store/db.py) after every page, keyed on its own (window_start,
+    window_end) -- deterministic across runs as long as start_ts/end_ts/
+    n_concurrent_windows don't change. A restarted process resumes each
+    sub-window from its last-saved cursor instead of re-walking from page
+    1, and a sub-window already marked 'done' is skipped entirely. Without
+    this, a real multi-hour run confirmed the failure mode directly: a
+    process restart (e.g. to pick up a code change) re-walked the densest
+    sub-window (the sports-heavy tail near R2_END) from scratch every time,
+    making zero net forward progress across several restarts."""
     log_id = db.log_fetch(conn, "pass1_discovery_live", f"{start_ts}-{end_ts}", "in_progress")
 
     span = end_ts - start_ts
@@ -110,7 +121,13 @@ async def discover_live_window(
     sub_windows = [(boundaries[i], boundaries[i + 1]) for i in range(n_concurrent_windows)]
 
     async def _walk_subwindow(sub_start: int, sub_end: int) -> tuple[int, int]:
-        cursor: str | None = None
+        checkpoint = db.get_live_window_scan_state(conn, sub_start, sub_end)
+        if checkpoint is not None and checkpoint["status"] == "done":
+            return 0, 0  # already fully walked in a prior run -- nothing new this call
+
+        cursor: str | None = checkpoint["cursor"] if checkpoint is not None else None
+        fetched_before = checkpoint["fetched_count"] if checkpoint is not None else 0
+        pages_before = checkpoint["pages_fetched"] if checkpoint is not None else 0
         fetched = 0
         pages = 0
         while True:
@@ -120,11 +137,19 @@ async def discover_live_window(
             for m in markets:
                 db.upsert_market(conn, _market_to_row(m, "live"))
             fetched += len(markets)
-            conn.commit()
             pages += 1
-            if not next_cursor or not markets:
-                break
+            done = not next_cursor or not markets
             cursor = next_cursor
+            db.upsert_live_window_scan_state(conn, {
+                "window_start": sub_start, "window_end": sub_end,
+                "status": "done" if done else "in_progress",
+                "cursor": cursor,
+                "fetched_count": fetched_before + fetched,
+                "pages_fetched": pages_before + pages,
+            })
+            conn.commit()
+            if done:
+                break
             if max_pages is not None and pages >= max_pages:
                 break
         return fetched, pages
@@ -135,7 +160,7 @@ async def discover_live_window(
 
     db.finish_fetch_log(
         conn, log_id, "done", fetched_count=fetched,
-        notes=f"{pages} pages across {n_concurrent_windows} concurrent sub-windows",
+        notes=f"{pages} pages across {n_concurrent_windows} concurrent sub-windows this call",
     )
     conn.commit()
     return {"fetched": fetched, "pages": pages}

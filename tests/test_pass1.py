@@ -111,6 +111,60 @@ def test_discover_live_window_splits_into_concurrent_subwindows(tmp_path):
     assert tickers == {f"M{i}" for i in range(n_windows)}
 
 
+def test_discover_live_window_resumes_from_saved_cursor(tmp_path):
+    """A partial call (bounded by max_pages, modeling either a verification
+    run or a process that gets restarted before finishing) must checkpoint
+    its cursor -- a later call resumes from it instead of re-fetching page 1,
+    the exact gap that let a real multi-hour run make zero net progress
+    across several restarts on its densest sub-window."""
+    conn = db.connect(tmp_path / "t.db")
+    window_key = (pass1.LIVE_METADATA_FLOOR, pass1.R2_END)
+    client = _FakeLiveDiscoveryClient({
+        window_key: [
+            ([_market("A-1", pass1.R1_START)], "cursor-after-page-1"),
+            ([_market("B-1", pass1.R1_START)], None),
+        ],
+    })
+    stats1 = asyncio.run(pass1.discover_live_window(client, conn, max_pages=1, n_concurrent_windows=1))
+    assert stats1["fetched"] == 1
+    assert stats1["pages"] == 1
+    checkpoint = db.get_live_window_scan_state(conn, *window_key)
+    assert checkpoint["status"] == "in_progress"
+    assert checkpoint["cursor"] == "cursor-after-page-1"
+
+    stats2 = asyncio.run(pass1.discover_live_window(client, conn, n_concurrent_windows=1))
+    assert stats2["fetched"] == 1  # only the NEW page fetched this call, not re-counting page 1
+    assert stats2["pages"] == 1
+    calls = client.calls_per_window[window_key]
+    assert calls[1] == "cursor-after-page-1"  # the resumed call's first request used the saved cursor
+
+    final_checkpoint = db.get_live_window_scan_state(conn, *window_key)
+    assert final_checkpoint["status"] == "done"
+    assert final_checkpoint["fetched_count"] == 2
+    tickers = {r[0] for r in conn.execute("SELECT ticker FROM markets").fetchall()}
+    assert tickers == {"A-1", "B-1"}
+
+
+def test_discover_live_window_skips_subwindow_already_done(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    window_key = (pass1.LIVE_METADATA_FLOOR, pass1.R2_END)
+    db.upsert_live_window_scan_state(conn, {
+        "window_start": window_key[0], "window_end": window_key[1],
+        "status": "done", "cursor": None, "fetched_count": 5, "pages_fetched": 3,
+    })
+    conn.commit()
+    client = _FakeLiveDiscoveryClient({
+        window_key: [([_market("SHOULD-NOT-APPEAR", pass1.R1_START)], None)],
+    })
+    stats = asyncio.run(pass1.discover_live_window(client, conn, n_concurrent_windows=1))
+    assert stats["fetched"] == 0
+    assert stats["pages"] == 0
+    assert window_key not in client.calls_per_window  # no HTTP call made at all
+    assert conn.execute(
+        "SELECT COUNT(*) FROM markets WHERE ticker='SHOULD-NOT-APPEAR'"
+    ).fetchone()[0] == 0
+
+
 # ---------------------------------------------------------------------------
 # discover_historical_series
 # ---------------------------------------------------------------------------

@@ -132,6 +132,28 @@ CREATE TABLE IF NOT EXISTS series_scan_state (
   updated_ts TEXT
 );
 
+-- Resumable checkpoint for discover_live_window's N concurrent live-sweep
+-- sub-windows (fetch/pass1.py) -- the historical scan above already had
+-- this via series_scan_state; the live sweep didn't, and a real multi-hour
+-- run confirmed the gap: restarting the process (to pick up a code change)
+-- threw away every sub-window's cursor, forcing a full re-walk from page 1
+-- even for sub-windows that were most of the way through a dense range
+-- (e.g. the sports-heavy tail near R2_END). Keyed on (window_start,
+-- window_end) rather than an arbitrary id -- discover_live_window computes
+-- the same sub-window boundaries deterministically from
+-- (start_ts, end_ts, n_concurrent_windows), so the key is stable across
+-- runs as long as those three don't change.
+CREATE TABLE IF NOT EXISTS live_window_scan_state (
+  window_start INTEGER NOT NULL,
+  window_end INTEGER NOT NULL,
+  status TEXT NOT NULL,        -- 'in_progress' | 'done'
+  cursor TEXT,
+  fetched_count INTEGER DEFAULT 0,
+  pages_fetched INTEGER DEFAULT 0,
+  updated_ts TEXT,
+  PRIMARY KEY (window_start, window_end)
+);
+
 -- Resumable per-market checkpoint for Pass 2's full trade-tape fetch.
 CREATE TABLE IF NOT EXISTS pass2_progress (
   ticker TEXT PRIMARY KEY REFERENCES markets(ticker),
@@ -311,6 +333,30 @@ def upsert_series_scan_state(conn: sqlite3.Connection, row: dict) -> None:
             markets_found_in_window=excluded.markets_found_in_window,
             reached_before_window=excluded.reached_before_window,
             last_cursor=excluded.last_cursor, updated_ts=excluded.updated_ts
+        """,
+        {**row, "now": now_utc_iso()},
+    )
+
+
+def get_live_window_scan_state(
+    conn: sqlite3.Connection, window_start: int, window_end: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM live_window_scan_state WHERE window_start = ? AND window_end = ?",
+        (window_start, window_end),
+    ).fetchone()
+
+
+def upsert_live_window_scan_state(conn: sqlite3.Connection, row: dict) -> None:
+    conn.execute(
+        """
+        INSERT INTO live_window_scan_state (window_start, window_end, status, cursor,
+                                            fetched_count, pages_fetched, updated_ts)
+        VALUES (:window_start, :window_end, :status, :cursor, :fetched_count, :pages_fetched, :now)
+        ON CONFLICT(window_start, window_end) DO UPDATE SET
+            status=excluded.status, cursor=excluded.cursor,
+            fetched_count=excluded.fetched_count, pages_fetched=excluded.pages_fetched,
+            updated_ts=excluded.updated_ts
         """,
         {**row, "now": now_utc_iso()},
     )
