@@ -360,7 +360,19 @@ async def fetch_closing_quote(
     client: KalshiClient, conn, ticker: str, event_ticker: str | None, close_time_epoch: int,
 ) -> dict[str, bool]:
     """One closing candlestick per market -- the input to spec S1's final
-    spread<=20c filter (Phase 3). Live then historical fallback."""
+    spread<=20c filter (Phase 3). Live then historical fallback.
+
+    ALWAYS writes a `quotes` row, even when neither endpoint family has a
+    quote -- previously this returned early and wrote nothing, which made
+    "Pass 1 hasn't reached this ticker yet" and "Pass 1 tried and Kalshi
+    genuinely has no bid/ask history here" both look like an absent row,
+    indistinguishable to r1/filters.py. Step Zero's Check 5 already found
+    the second case is real for most of 2023/2024/2025-jan-apr -- the R1
+    count-reconciliation gate needs "a row exists with spread IS NULL"
+    (attempted, not found) as a distinct, queryable state from "no row at
+    all" (not yet attempted) to separate a structural coverage gap from an
+    incomplete fetch in its own delta reporting (r1/reconcile.py's
+    coverage_gap_breakdown)."""
     start_ts, end_ts = close_time_epoch - 86_400, close_time_epoch
     candles = []
     source = "live"
@@ -384,6 +396,11 @@ async def fetch_closing_quote(
 
     quoted = [c for c in candles if c.has_quote]
     if not quoted:
+        db.upsert_quote(conn, {
+            "ticker": ticker, "end_period_ts": None, "yes_bid_close": None,
+            "yes_ask_close": None, "spread": None, "source": source,
+        })
+        conn.commit()
         return {"has_quote": False}
     last = max(quoted, key=lambda c: c.end_period_ts or 0)
     spread = None

@@ -339,7 +339,9 @@ def test_fetch_closing_quote_prefers_live(tmp_path):
     client = _FakeQuoteClient(live_candles=[_candle(1000, 0.45, 0.47)])
     result = asyncio.run(pass1.fetch_closing_quote(client, conn, "A-1", "EVT-1", 2000))
     assert result["has_quote"] is True
-    row = conn.execute("SELECT source, spread FROM quotes WHERE ticker='A-1'").fetchone()
+    row = conn.execute(
+        "SELECT source, spread FROM quotes WHERE ticker='A-1'"
+    ).fetchone()
     assert row[0] == "live"
     assert abs(row[1] - 0.02) < 1e-9
 
@@ -354,13 +356,19 @@ def test_fetch_closing_quote_falls_back_to_historical(tmp_path):
     assert row[0] == "historical"
 
 
-def test_fetch_closing_quote_no_quote_anywhere(tmp_path):
+def test_fetch_closing_quote_no_quote_anywhere_still_writes_a_row(tmp_path):
+    """Neither live nor historical had a quote -- must still write a
+    `quotes` row with spread=NULL, distinct from no row at all, so
+    r1/filters.py can tell "attempted, not found" (structural) apart
+    from "not yet attempted" (operational)."""
     conn = db.connect(tmp_path / "t.db")
     db.upsert_market(conn, {"ticker": "A-1"})
     client = _FakeQuoteClient(live_candles=[], historical_candles=[])
     result = asyncio.run(pass1.fetch_closing_quote(client, conn, "A-1", "EVT-1", 2000))
     assert result["has_quote"] is False
-    assert conn.execute("SELECT COUNT(*) FROM quotes").fetchone()[0] == 0
+    row = conn.execute("SELECT spread FROM quotes WHERE ticker='A-1'").fetchone()
+    assert row is not None
+    assert row[0] is None
 
 
 # ---------------------------------------------------------------------------

@@ -247,3 +247,26 @@ def test_write_divergence_log_produces_readable_file(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "By-year psi" in text
     assert "2022" in text
+
+
+def test_write_divergence_log_includes_field_population_section_when_present(tmp_path):
+    report = {
+        "by_year_psi": {}, "by_category_psi": {},
+        "taker_field_population_by_era": {
+            "2021-2022": {
+                "trade_count": 152, "taker_outcome_side_population": 1.0,
+                "taker_book_side_population": 1.0, "taker_side_legacy_population": 1.0,
+            },
+            "2023": {"trade_count": 0},
+        },
+    }
+    path = write_divergence_log(report, tmp_path / "divergence_log.md")
+    text = path.read_text(encoding="utf-8")
+    assert "Taker-field population by era" in text
+    assert "152" in text
+
+
+def test_write_divergence_log_omits_field_population_section_when_absent(tmp_path):
+    path = write_divergence_log({"by_year_psi": {}, "by_category_psi": {}}, tmp_path / "divergence_log.md")
+    text = path.read_text(encoding="utf-8")
+    assert "Taker-field population by era" not in text

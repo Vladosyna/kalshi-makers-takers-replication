@@ -62,6 +62,22 @@ def test_upsert_quote(tmp_path):
     assert row[0] == 0.02
 
 
+def test_upsert_quote_attempted_with_no_data_found(tmp_path):
+    """The "attempted, nothing found" case: caller passes spread=None (and
+    the other quote fields None) -- a row still exists, distinguishing it
+    from a ticker whose quote fetch was never attempted at all (no row)."""
+    conn = db.connect(tmp_path / "test.db")
+    db.upsert_market(conn, {"ticker": "ABC-1"})
+    db.upsert_quote(conn, {
+        "ticker": "ABC-1", "end_period_ts": None, "yes_bid_close": None,
+        "yes_ask_close": None, "spread": None, "source": "historical",
+    })
+    conn.commit()
+    row = conn.execute("SELECT spread FROM quotes WHERE ticker = 'ABC-1'").fetchone()
+    assert row is not None
+    assert row[0] is None
+
+
 def test_upsert_price_panel_row_dedups_on_ticker_and_lookback_day(tmp_path):
     conn = db.connect(tmp_path / "test.db")
     db.upsert_market(conn, {"ticker": "ABC-1"})

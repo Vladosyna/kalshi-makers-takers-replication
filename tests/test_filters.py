@@ -47,11 +47,31 @@ def test_wide_spread_fails(tmp_path):
     assert "spread_above_20c" in r.reason_codes
 
 
-def test_missing_quote_fails_as_no_quote_available(tmp_path):
+def test_no_quote_row_at_all_fails_as_not_yet_fetched(tmp_path):
+    """No `quotes` row means Pass 1 hasn't attempted this ticker's quote
+    fetch yet -- an operational gap, not a structural one."""
     conn = db.connect(tmp_path / "t.db")
     _seed(conn, "NOQUOTE", with_quote=False)
     r = apply_r1_filters(conn)[0]
-    assert "no_quote_available" in r.reason_codes
+    assert "spread_filter_not_yet_fetched" in r.reason_codes
+    assert "spread_filter_not_computable" not in r.reason_codes
+
+
+def test_attempted_quote_with_no_data_fails_as_not_computable(tmp_path):
+    """A `quotes` row DOES exist (Pass 1 tried live+historical) but
+    spread is null -- Kalshi genuinely has no bid/ask history here (Step
+    Zero Check 5's own finding). Structural, not operational -- must not
+    collapse into the same reason code as an unattempted ticker."""
+    conn = db.connect(tmp_path / "t.db")
+    _seed(conn, "NODATA", with_quote=False)
+    db.upsert_quote(conn, {
+        "ticker": "NODATA", "end_period_ts": None, "yes_bid_close": None,
+        "yes_ask_close": None, "spread": None, "source": "historical",
+    })
+    conn.commit()
+    r = apply_r1_filters(conn)[0]
+    assert "spread_filter_not_computable" in r.reason_codes
+    assert "spread_filter_not_yet_fetched" not in r.reason_codes
 
 
 def test_short_open_duration_fails(tmp_path):

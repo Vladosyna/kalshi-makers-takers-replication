@@ -71,6 +71,54 @@ def reconcile_counts(conn, yes_only: pl.DataFrame, doubled: pl.DataFrame) -> dic
     return {"actual": actual, "targets": BDW_TARGETS, "deltas": deltas}
 
 
+STRUCTURAL_GAP_REASON = "spread_filter_not_computable"
+OPERATIONAL_GAP_REASON = "spread_filter_not_yet_fetched"
+
+
+def coverage_gap_breakdown(conn, window: str = "r1") -> dict[str, Any]:
+    """Splits `window`'s universe_log exclusions into the three buckets the
+    count-reconciliation gate needs to reason about separately (spec's own
+    "coverage/filter question, not a sampling question" framing, S1):
+
+      structural_spread_filter_not_computable -- r1/filters.py's
+        'spread_filter_not_computable': Pass 1 tried live+historical and
+        Kalshi genuinely has no bid/ask history for this market (Step Zero
+        Check 5's own PARTIAL finding -- real for most of 2023/2024/
+        2025-jan-apr). This portion of any count delta against BDW cannot
+        shrink by fetching more; if BDW's own spread filter had access to
+        quote data ours structurally lacks, this is exactly where the two
+        samples diverge, and it should be reported as its own line rather
+        than folded into "other coverage gaps."
+      operational_spread_filter_not_yet_fetched -- r1/filters.py's
+        'spread_filter_not_yet_fetched': Pass 1 simply hasn't reached this
+        market's quote-fetch step yet. Expected to shrink toward zero as
+        collection progresses -- a nonzero count here means part of any
+        count delta is still an artifact of an incomplete fetch, not a real
+        divergence, and re-running reconciliation later should be expected
+        to change this number even with nothing else changing.
+      other_filter_exclusions -- every other exclusion reason (volume,
+        duration, settlement-mismatch) -- ordinary filter exclusions, not a
+        quote-availability question at all.
+    """
+    rows = conn.execute(
+        "SELECT reason_code, COUNT(*) AS n FROM universe_log WHERE window = ? GROUP BY reason_code",
+        (window,),
+    ).fetchall()
+    reason_counts = {r["reason_code"]: r["n"] for r in rows}
+    structural = reason_counts.get(STRUCTURAL_GAP_REASON, 0)
+    operational = reason_counts.get(OPERATIONAL_GAP_REASON, 0)
+    other = sum(
+        n for code, n in reason_counts.items()
+        if code not in (STRUCTURAL_GAP_REASON, OPERATIONAL_GAP_REASON)
+    )
+    return {
+        "structural_spread_filter_not_computable": structural,
+        "operational_spread_filter_not_yet_fetched": operational,
+        "other_filter_exclusions": other,
+        "reason_counts": reason_counts,
+    }
+
+
 def compute_calendar_2024_mix(yes_only: pl.DataFrame) -> dict[str, float]:
     """Per-category share of in-scope, R1-window contracts closing in
     calendar 2024, by CONTRACT count (dedup to one row per ticker -- the

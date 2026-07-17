@@ -6,6 +6,7 @@ from kalshi_mt.r1.panel import build_doubled_panel, build_yes_only_panel
 from kalshi_mt.r1.reconcile import (
     BDW_TARGETS,
     compute_calendar_2024_mix,
+    coverage_gap_breakdown,
     load_frozen_2024_mix,
     reconcile_counts,
     write_frozen_2024_mix,
@@ -79,6 +80,48 @@ def test_reconcile_counts_empty_panel(tmp_path):
     result = reconcile_counts(conn, empty, empty)
     assert result["actual"]["events"] == 0
     assert result["actual"]["yes_prices"] == 0
+
+
+# ---------------------------------------------------------------------------
+# coverage_gap_breakdown
+# ---------------------------------------------------------------------------
+
+def test_coverage_gap_breakdown_splits_structural_vs_operational_vs_other(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    db.log_universe_exclusions(conn, "r1", [
+        ("A", "spread_filter_not_computable"),
+        ("B", "spread_filter_not_computable"),
+        ("C", "spread_filter_not_yet_fetched"),
+        ("D", "volume_below_1000"),
+        ("D", "open_below_24h"),
+    ])
+    conn.commit()
+    result = coverage_gap_breakdown(conn, window="r1")
+    assert result["structural_spread_filter_not_computable"] == 2
+    assert result["operational_spread_filter_not_yet_fetched"] == 1
+    assert result["other_filter_exclusions"] == 2
+    assert result["reason_counts"]["volume_below_1000"] == 1
+    assert result["reason_counts"]["open_below_24h"] == 1
+
+
+def test_coverage_gap_breakdown_empty_log(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    result = coverage_gap_breakdown(conn, window="r1")
+    assert result == {
+        "structural_spread_filter_not_computable": 0,
+        "operational_spread_filter_not_yet_fetched": 0,
+        "other_filter_exclusions": 0,
+        "reason_counts": {},
+    }
+
+
+def test_coverage_gap_breakdown_respects_window(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    db.log_universe_exclusions(conn, "r1", [("A", "spread_filter_not_computable")])
+    db.log_universe_exclusions(conn, "r2", [("B", "spread_filter_not_computable")])
+    conn.commit()
+    r1_result = coverage_gap_breakdown(conn, window="r1")
+    assert r1_result["structural_spread_filter_not_computable"] == 1
 
 
 # ---------------------------------------------------------------------------

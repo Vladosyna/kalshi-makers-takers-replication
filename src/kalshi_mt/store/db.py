@@ -51,7 +51,19 @@ CREATE INDEX IF NOT EXISTS idx_markets_r2 ON markets(in_r2_window);
 
 -- The closing candlestick per market, used for the spec's final-spread<=20c
 -- filter (Phase 3). One row per market -- the filter only needs the quote
--- nearest close_time, not a full quote history.
+-- nearest close_time, not a full quote history. A row is written every time
+-- Pass 1 ATTEMPTS this market's quote fetch, whether or not a quote was
+-- found (fetch/pass1.py's fetch_closing_quote) -- so "no row at all" means
+-- "not yet attempted", distinct from a row with spread IS NULL, which means
+-- "attempted (live then historical) and Kalshi genuinely has no bid/ask
+-- history here" (Step Zero Check 5's own PARTIAL finding: real for most of
+-- 2023/2024/2025-jan-apr). r1/filters.py's spread filter needs exactly this
+-- distinction (row exists? + spread nullity) to separate a structural
+-- coverage gap from an incomplete fetch -- deliberately NOT a separate
+-- has_quote_data column: that would duplicate a signal spread IS NULL
+-- already carries, for no consumer, while adding a real footgun (a value
+-- that would need backfilling on any pre-existing database, easy to get
+-- out of sync with what the found/not-found rows actually mean).
 CREATE TABLE IF NOT EXISTS quotes (
   ticker TEXT PRIMARY KEY REFERENCES markets(ticker),
   end_period_ts INTEGER,
@@ -141,7 +153,11 @@ CREATE TABLE IF NOT EXISTS universe_log (
   ts TEXT NOT NULL,
   ticker TEXT NOT NULL,
   window TEXT NOT NULL,        -- 'r1' | 'r2'
-  reason_code TEXT NOT NULL    -- 'volume_below_1000' | 'spread_above_20c' | 'no_quote_available'
+  reason_code TEXT NOT NULL    -- 'volume_below_1000' | 'spread_above_20c'
+                                -- | 'spread_filter_not_yet_fetched' (operational: Pass 1
+                                --   hasn't attempted this ticker's quote fetch yet)
+                                -- | 'spread_filter_not_computable' (structural: Pass 1
+                                --   tried live+historical and Kalshi has no bid/ask here)
                                 -- | 'missing_open_or_close_time' | 'open_below_24h'
                                 -- | 'settlement_last_trade_mismatch'
 );
@@ -205,6 +221,12 @@ def upsert_market(conn: sqlite3.Connection, row: dict) -> None:
 
 
 def upsert_quote(conn: sqlite3.Connection, row: dict) -> None:
+    """Callers pass spread=None (with the other quote fields also None)
+    for the "attempted, nothing found" case -- fetch/pass1.py's
+    fetch_closing_quote writes a row either way, so a market's absence
+    from this table means Pass 1 hasn't attempted its quote fetch yet,
+    while a present row with spread IS NULL means it was attempted and
+    Kalshi genuinely has no bid/ask history there."""
     conn.execute(
         """
         INSERT INTO quotes (ticker, end_period_ts, yes_bid_close, yes_ask_close, spread,

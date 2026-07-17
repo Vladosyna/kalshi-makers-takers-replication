@@ -212,5 +212,32 @@ def write_divergence_log(report: dict[str, Any], path: str | Path) -> Path:
             lines.append(f"| {category} | insufficient data | - |")
     lines.append("")
 
+    field_population = report.get("taker_field_population_by_era")
+    if field_population:
+        lines += [
+            "## Taker-field population by era (full Pass 2 tape)",
+            "",
+            "Step Zero Check 3 (reports/step_zero/findings.md) samples one market per "
+            "era via a live probe -- three of its four eras returned zero trades for "
+            "their sampled candidate, so its PASS verdict rests on a single 2021 market. "
+            "This table recomputes the same population rates over every trade Pass 2 has "
+            "actually fetched, per era.",
+            "",
+            "| Era | Trades | outcome_side pop. | book_side pop. | legacy taker_side pop. |",
+            "|---|---|---|---|---|",
+        ]
+        for era, entry in field_population.items():
+            label = "unassigned (unparseable/out-of-range)" if era == "_unassigned" else era
+            n = entry.get("trade_count", 0)
+            if n == 0:
+                lines.append(f"| {label} | 0 | n/a | n/a | n/a |")
+            else:
+                lines.append(
+                    f"| {label} | {n} | {entry['taker_outcome_side_population']:.4f} | "
+                    f"{entry['taker_book_side_population']:.4f} | "
+                    f"{entry['taker_side_legacy_population']:.4f} |"
+                )
+        lines.append("")
+
     path.write_text("\n".join(lines), encoding="utf-8")
     return path

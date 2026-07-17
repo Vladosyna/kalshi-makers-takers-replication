@@ -229,7 +229,12 @@ def build() -> None:
     frozen calendar-2024 category-mix artifact Phase 7 depends on."""
     from kalshi_mt.r1.filters import apply_and_log
     from kalshi_mt.r1.panel import basis_counts, build_doubled_panel, build_yes_only_panel
-    from kalshi_mt.r1.reconcile import compute_calendar_2024_mix, reconcile_counts, write_frozen_2024_mix
+    from kalshi_mt.r1.reconcile import (
+        compute_calendar_2024_mix,
+        coverage_gap_breakdown,
+        reconcile_counts,
+        write_frozen_2024_mix,
+    )
     from kalshi_mt.store import db
     from kalshi_mt.util import PROJECT_ROOT
 
@@ -247,6 +252,7 @@ def build() -> None:
         yes_only = build_yes_only_panel(conn, in_scope)
         doubled = build_doubled_panel(yes_only)
         reconciliation = reconcile_counts(conn, yes_only, doubled)
+        gap_breakdown = coverage_gap_breakdown(conn, window="r1")
 
         mix = compute_calendar_2024_mix(yes_only)
         mix_path = write_frozen_2024_mix(mix, PROJECT_ROOT / "data" / "frozen_2024_mix.json")
@@ -255,6 +261,7 @@ def build() -> None:
             "filters": filter_summary,
             "panel": basis_counts(yes_only, doubled),
             "reconciliation": reconciliation["deltas"],
+            "coverage_gap_breakdown": gap_breakdown,
             "frozen_2024_mix": {"path": str(mix_path), "categories": len(mix)},
         }
     finally:
@@ -269,6 +276,7 @@ def r1() -> None:
     BDW Tables 8-9, win-rate curve vs Fig 3, returns-by-band vs Fig 5,
     maker/taker split vs Fig 6/Table 10, divergence log."""
     from kalshi_mt.fees.schedule import load_fee_schedule
+    from kalshi_mt.r1.field_population import field_population_by_era
     from kalshi_mt.r1.panel import build_doubled_panel, build_yes_only_panel
     from kalshi_mt.r1.regression import verify_two_way_equals_one_way_clustering
     from kalshi_mt.r1.reproduction import (
@@ -309,9 +317,13 @@ def r1() -> None:
         trade_store = TradeStore(config["storage"]["parquet_dir"])
         trades = trade_store.read_all()
         mt_split = maker_taker_split(trades, resolutions, in_scope)
+        field_population = field_population_by_era(trades)
 
         log_path = write_divergence_log(
-            {"by_year_psi": by_year, "by_category_psi": by_category},
+            {
+                "by_year_psi": by_year, "by_category_psi": by_category,
+                "taker_field_population_by_era": field_population,
+            },
             PROJECT_ROOT / "reports" / "r1" / "divergence_log.md",
         )
 
@@ -332,6 +344,7 @@ def r1() -> None:
             "win_rate_by_band": win_rate_by_band(doubled),
             "returns_by_band": returns_by_band(yes_only, fee_schedule),
             "maker_taker_split": mt_split,
+            "taker_field_population_by_era": field_population,
             "divergence_log": str(log_path),
         }
     finally:

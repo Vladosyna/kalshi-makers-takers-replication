@@ -46,15 +46,19 @@ def apply_r1_filters(conn, window: str = "r1") -> list[FilterResult]:
     R2 spec is described as an extension of R1's own construction, with no
     separate filter definition restated, so R2 reuses R1's volume/spread/
     duration/settlement-mismatch criteria unchanged, applied to the R2
-    window's markets. A market with no quote row yet is reported as
-    failing on 'no_quote_available' -- not silently skipped -- since
-    incomplete Pass 1 coverage should be visible in the reconciliation
-    counts, not swallowed."""
+    window's markets. A market with no quote row yet fails on
+    'spread_filter_not_yet_fetched' (operational -- Pass 1 hasn't attempted
+    it); a market whose quote WAS attempted (live+historical) but Kalshi had
+    no bid/ask history fails on 'spread_filter_not_computable' (structural --
+    won't resolve by fetching more, per Step Zero Check 5's own finding).
+    Neither is silently skipped -- incomplete Pass 1 coverage should be
+    visible in the reconciliation counts, split by which of the two it is
+    (reconcile.py's coverage_gap_breakdown), not swallowed into one bucket."""
     window_column = {"r1": "in_r1_window", "r2": "in_r2_window"}[window]
     rows = conn.execute(
         f"""
         SELECT m.ticker, m.volume_fp, m.open_time_epoch, m.close_time_epoch, m.result,
-               q.spread
+               q.spread, (q.ticker IS NOT NULL) AS quote_attempted
         FROM markets m
         LEFT JOIN quotes q ON q.ticker = m.ticker
         WHERE m.{window_column} = 1
@@ -73,8 +77,10 @@ def apply_r1_filters(conn, window: str = "r1") -> list[FilterResult]:
         reasons = []
         if row["volume_fp"] is None or row["volume_fp"] < MIN_VOLUME_FP:
             reasons.append("volume_below_1000")
-        if row["spread"] is None:
-            reasons.append("no_quote_available")
+        if not row["quote_attempted"]:
+            reasons.append("spread_filter_not_yet_fetched")
+        elif row["spread"] is None:
+            reasons.append("spread_filter_not_computable")
         elif row["spread"] > MAX_SPREAD:
             reasons.append("spread_above_20c")
         if row["open_time_epoch"] is None or row["close_time_epoch"] is None:
