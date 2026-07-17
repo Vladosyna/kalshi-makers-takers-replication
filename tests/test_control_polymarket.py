@@ -11,7 +11,7 @@ from kalshi_mt.control.polymarket import (
     MonthlyPsiResult,
     _detect_column,
     _outcome_to_float,
-    _to_epoch,
+    _parse_outcome_prices_first,
     build_polymarket_panel,
     load_category_map,
     monthly_psi_path,
@@ -52,25 +52,19 @@ def test_outcome_to_float(raw, expected):
 
 
 # ---------------------------------------------------------------------------
-# _to_epoch
+# _parse_outcome_prices_first -- the REAL archive's outcome column shape
+# (verified 2026-07-17 against the actual downloaded data/bootstrap files:
+# markets.parquet has no scalar outcome/result/winner column at all, only
+# `outcome_prices`, a stringified 2-element list)
 # ---------------------------------------------------------------------------
 
-def test_to_epoch_from_int():
-    assert _to_epoch(1234567) == 1234567
-
-
-def test_to_epoch_from_iso_string():
-    assert _to_epoch("2025-06-15T00:00:00Z") == _epoch(2025, 6, 15)
-
-
-def test_to_epoch_from_datetime():
-    dt = datetime(2025, 6, 15, tzinfo=timezone.utc)
-    assert _to_epoch(dt) == _epoch(2025, 6, 15)
-
-
-def test_to_epoch_invalid_returns_none():
-    assert _to_epoch("not-a-date") is None
-    assert _to_epoch(None) is None
+@pytest.mark.parametrize("raw,expected", [
+    ("['1', '0']", 1.0), ("['0', '1']", 0.0),
+    ("[1, 0]", 1.0), ("[0.0, 1.0]", 0.0),
+    (None, None), ("not-a-list", None), ("[]", None), ("42", None),
+])
+def test_parse_outcome_prices_first(raw, expected):
+    assert _parse_outcome_prices_first(raw) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +163,58 @@ def test_build_polymarket_panel_unmapped_category_stays_none_not_dropped():
         panel = build_polymarket_panel(quant_path, markets_path, category_map={"Weather": "Climate and Weather"})
         assert len(panel) == 1
         assert panel["category"][0] is None
+
+
+def test_build_polymarket_panel_supports_real_outcome_prices_column_shape(tmp_path):
+    """The real archive (data/bootstrap/markets.parquet) has no scalar
+    outcome column at all -- only `outcome_prices`, a stringified
+    2-element list. This must resolve through the exact same pipeline as
+    a scalar `outcome` column, not require a separate caller-facing path."""
+    markets_path = tmp_path / "markets.parquet"
+    quant_path = tmp_path / "quant.parquet"
+    _write_markets_parquet(markets_path, [
+        {"condition_id": "M1", "outcome_prices": "['1', '0']",
+         "end_date_iso": "2025-06-15T00:00:00Z", "category": "Weather"},
+        {"condition_id": "M2", "outcome_prices": "['0', '1']",
+         "end_date_iso": "2025-06-16T00:00:00Z", "category": "Weather"},
+    ])
+    _write_quant_parquet(quant_path, [
+        {"condition_id": "M1", "price": 0.99, "timestamp": _epoch(2025, 6, 14)},
+        {"condition_id": "M2", "price": 0.01, "timestamp": _epoch(2025, 6, 15)},
+    ])
+    panel = build_polymarket_panel(quant_path, markets_path, category_map={})
+    assert set(panel["ticker"].to_list()) == {"M1", "M2"}
+    m1 = panel.filter(pl.col("ticker") == "M1").row(0, named=True)
+    m2 = panel.filter(pl.col("ticker") == "M2").row(0, named=True)
+    assert m1["y"] == 1.0
+    assert m2["y"] == 0.0
+
+
+def test_build_polymarket_panel_prefilters_by_date_with_native_datetime_column(tmp_path):
+    """The real archive's resolved_ts column is a native Datetime dtype
+    (not a string) -- the join must push the [start, end] filter down onto
+    it, and must still exclude a resolved-outside-window market exactly as
+    the string-dtype path does (this is a memory-safety optimization, the
+    end result must be identical)."""
+    markets_path = tmp_path / "markets.parquet"
+    quant_path = tmp_path / "quant.parquet"
+    pl.DataFrame({
+        "condition_id": ["IN-WINDOW", "OUT-OF-WINDOW"],
+        "outcome": ["yes", "yes"],
+        "end_date": [
+            datetime(2025, 6, 15, tzinfo=timezone.utc),
+            datetime(2026, 3, 1, tzinfo=timezone.utc),
+        ],
+    }).write_parquet(markets_path)
+    pl.DataFrame({
+        "condition_id": ["IN-WINDOW", "OUT-OF-WINDOW"],
+        "price": [0.6, 0.4],
+        "timestamp": [_epoch(2025, 6, 10), _epoch(2026, 2, 20)],
+    }).write_parquet(quant_path)
+
+    panel = build_polymarket_panel(quant_path, markets_path, category_map={})
+    assert panel["ticker"].to_list() == ["IN-WINDOW"]
+    assert panel.row(0, named=True)["p"] == 0.6
 
 
 def test_build_polymarket_panel_rejects_window_outside_control_coverage():

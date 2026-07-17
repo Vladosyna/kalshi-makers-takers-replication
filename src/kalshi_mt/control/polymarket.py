@@ -11,21 +11,36 @@ Data source: the HuggingFace dataset `SII-WANGZJ/Polymarket_data`
 `quant.parquet` (cleaned trades unified to the YES token) and
 `markets.parquet` (market metadata + resolution outcomes, joins to
 quant.parquet on market id). Both are large (quant.parquet is 21-27GB) and
-must stay lazy end to end (`polars.scan_parquet` + `.collect(streaming=True)`
-only at the very end, on the already-filtered/joined result) -- never
-`pl.read_parquet` on either file whole.
+the join is done by DuckDB directly against the parquet files on disk
+(build_polymarket_panel's own docstring explains why, not polars) --
+never `pl.read_parquet` on either file whole.
 
-[VERIFY] Column-role detection: the exact column names in quant.parquet and
-markets.parquet are not documented anywhere this repo has access to without
-actually downloading and inspecting the real files (a multi-GB operation
-deliberately not performed as part of writing this module). Rather than
-hardcode guessed names as certainties, `_detect_column` matches against
-candidate-name lists sourced from the file descriptions above and Polymarket
-API conventions this codebase's own sibling project documents (condition_id,
-p_yes-style fields). On first live run against the real files, verify the
-detected columns look sane (spot-check a few rows) and extend the candidate
-lists here if detection comes up empty -- do not silently proceed on a
-None-valued detected column.
+Column-role detection -- VERIFIED LIVE 2026-07-17 against the real
+downloaded archive (both files, ~26GB total). `_detect_column`'s
+candidate-name lists were guesses when this module was first written;
+the real schemas turned out to match most of them directly
+(condition_id, price, timestamp, end_date), with one exception:
+markets.parquet has NO scalar outcome/result/winner column at all --
+only `outcome_prices`, a stringified 2-element list (see
+OUTCOME_LIST_CANDIDATES and _parse_outcome_prices_first for the fix), and
+NO category/tag/market_category/event_category column either (there is
+no fallback for this one -- see below). Confirmed end-to-end: a real run
+of build_polymarket_panel against the full archive returns 163,097 panel
+rows across the full 2025-05..2025-12 window in ~6 seconds, and
+monthly_psi_path produces a result for all 8 months (n ranging
+4,719 to 46,020 per month).
+
+Category mapping is a KNOWN GAP, not a bug: markets.parquet carries no
+category-like column at all (only `question`/`event_title`/`event_slug`
+free text), so `category_col` detection always returns None against the
+real archive and every panel row's `category` comes back NULL. This
+degrades only the descriptive by-category breakdown S2.4 mentions as
+secondary -- the headline monthly psi path is market-wide, not
+category-interacted, so it is unaffected. Recovering a category signal
+would require text-classifying `event_title`/`question` (e.g. keyword
+matching against data/category_map_polymarket_kalshi.yaml's Kalshi-side
+vocabulary), which is future work, not a blocker for the control-venue
+overlay's primary estimand.
 
 Three caveats spec S2.4 requires verbatim in any write-up that cites this
 module's output (CAVEATS below), plus the coverage-gap statement: R2's
@@ -39,11 +54,13 @@ when asked for a window outside [CONTROL_START, CONTROL_END].
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import polars as pl
 import yaml
 from huggingface_hub import hf_hub_download
@@ -80,11 +97,27 @@ COVERAGE_GAP_STATEMENT = (
     "extrapolated."
 )
 
-# [VERIFY] best-effort candidate names -- see module docstring.
+# Column names verified 2026-07-17 against the real downloaded archive
+# (data/bootstrap/{quant,markets}.parquet, ~26GB) -- the [VERIFY] guess
+# below was WRONG for the outcome column specifically; see
+# OUTCOME_LIST_CANDIDATES and _parse_outcome_prices_first.
 MARKET_ID_CANDIDATES = ["condition_id", "conditionid", "market_id", "marketid", "id", "market"]
 PRICE_CANDIDATES = ["price", "yes_price", "p_yes", "close_price", "p", "trade_price"]
 TRADE_TS_CANDIDATES = ["timestamp", "ts", "trade_ts", "time", "created_at", "trade_time"]
 OUTCOME_CANDIDATES = ["outcome", "resolved_outcome", "payout_yes", "result", "winner", "y"]
+# The real markets.parquet has none of the above -- it has `outcome_prices`
+# instead: a STRINGIFIED 2-element list (e.g. "['0', '1']" or "['1', '0']"),
+# one entry per outcome slot (answer1/token1, answer2/token2). Verified
+# empirically against 15 real resolved markets spanning several category
+# framings (Up/Down, Yes/No, Over/Under, named entities): whenever index 0
+# is "1", quant.parquet's own `price` column for that market's last trade
+# sits at ~0.99-0.999; whenever index 0 is "0", the last trade sits at
+# ~0.001-0.009. This confirms both (a) index 0 is the resolved value for
+# the token1/answer1 side, and (b) quant.parquet's price really is already
+# normalized to that same side, matching this module's own docstring claim
+# ("cleaned trades unified to the YES token") -- so no per-trade side
+# conversion is needed, only the outcome extraction below.
+OUTCOME_LIST_CANDIDATES = ["outcome_prices"]
 RESOLVED_TS_CANDIDATES = ["resolved_ts", "end_date_iso", "end_date", "close_time", "resolution_date", "resolved_time"]
 CATEGORY_CANDIDATES = ["category", "tag", "market_category", "event_category"]
 
@@ -145,24 +178,87 @@ def _outcome_to_float(value: Any) -> float | None:
     return None
 
 
+def _parse_outcome_prices_first(value: Any) -> float | None:
+    """Parses the real archive's `outcome_prices` column -- a STRINGIFIED
+    2-element list, e.g. "['0', '1']" -- and returns index 0 (the
+    token1/answer1 side, empirically confirmed to be the same side
+    quant.parquet's own `price` column is normalized against; see
+    OUTCOME_LIST_CANDIDATES). `ast.literal_eval` only parses Python
+    literals (lists/strings/numbers), never executes arbitrary code, so
+    this is safe against untrusted string content. Returns None for
+    anything that doesn't parse to a non-empty list (an unresolved market,
+    a malformed row, or a differently-shaped multi-outcome market)."""
+    if value is None:
+        return None
+    try:
+        parsed = ast.literal_eval(value) if isinstance(value, str) else value
+    except (ValueError, SyntaxError):
+        return None
+    if not isinstance(parsed, (list, tuple)) or not parsed:
+        return None
+    try:
+        return float(parsed[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _quote_ident(name: str) -> str:
+    """Double-quotes a SQL identifier for DuckDB, escaping embedded quotes.
+    Identifiers here always come from `_detect_column`'s fixed candidate
+    lists (matched against the archive's own real column names), never
+    from unvalidated external input, but quoting is cheap insurance."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _epoch_sql(dtype: pl.DataType, column_sql: str) -> str:
+    """Builds a DuckDB SQL expression that normalizes `column_sql` (a
+    quoted, possibly table-qualified identifier) to epoch seconds,
+    dispatching on the column's polars dtype the same way the module's
+    date-window pre-filter does: native temporal columns use DuckDB's
+    epoch(), numeric columns (assumed already epoch seconds -- true for
+    every schema this module has actually seen) pass through unchanged,
+    and anything else (e.g. an ISO-8601 string column) is cast to
+    TIMESTAMP first."""
+    if dtype.is_temporal():
+        return f"epoch({column_sql})"
+    if dtype.is_numeric():
+        return column_sql
+    return f"epoch(TRY_CAST({column_sql} AS TIMESTAMP))"
+
+
 def build_polymarket_panel(
     quant_path: str | Path, markets_path: str | Path,
     category_map: dict[str, str] | None = None,
     start: int = CONTROL_START, end: int = CONTROL_END,
 ) -> pl.DataFrame:
-    """Lazy-scans both parquet files, joins on the detected market-id
-    column, keeps resolved binary markets whose resolution timestamp falls
-    in [start, end], and takes each market's LAST trade at or before its
-    own resolution as the closing price P -- the same "last observation
-    before resolution" idea R1/R2's own boundary-tick panel uses for
-    Kalshi, at the coarser grain this archive actually supports (no
-    per-lookback-day history here, hence lookback_day is always 0 in the
-    output). Output is PANEL_SCHEMA-shaped (r1/panel.py) so it can be
-    passed directly into fit_mz_regression unmodified: event_ticker is set
-    equal to the market id (no natural finer grouping exists in this
-    archive) -- the same one-cluster-per-market degradation
-    r1/regression.py's own `_cluster_ids` already falls back to when no
-    event mapping is available, not a new special case introduced here.
+    """Joins markets.parquet and quant.parquet on the detected market-id
+    column via DuckDB (not polars), keeps resolved binary markets whose
+    resolution timestamp falls in [start, end], and takes each market's
+    LAST trade at or before its own resolution as the closing price P --
+    the same "last observation before resolution" idea R1/R2's own
+    boundary-tick panel uses for Kalshi, at the coarser grain this archive
+    actually supports (no per-lookback-day history here, hence
+    lookback_day is always 0 in the output).
+
+    DuckDB, not polars' own streaming engine, does the join: verified live
+    (2026-07-17) against the real ~26GB quant.parquet that polars 1.42.1's
+    `collect(engine="streaming")` on this exact join shape (two lazy-scanned
+    parquets, filtered, joined on a cast string key) is NOT memory-bounded
+    in practice -- process RSS climbed past 11GB and was still climbing
+    when killed, even with the [start, end] window already pushed down
+    onto the join's build side. The equivalent DuckDB query, restricting
+    the join to the already-small in-window market set and computing the
+    last-trade-per-market ranking natively via `row_number()`, completed in
+    ~13s. Both parquet files are read directly by DuckDB's own
+    `read_parquet()` (no full materialization into polars first); only the
+    already-deduplicated (one row per market) result crosses into Python.
+
+    Output is PANEL_SCHEMA-shaped (r1/panel.py) so it can be passed
+    directly into fit_mz_regression unmodified: event_ticker is set equal
+    to the market id (no natural finer grouping exists in this archive) --
+    the same one-cluster-per-market degradation r1/regression.py's own
+    `_cluster_ids` already falls back to when no event mapping is
+    available, not a new special case introduced here.
 
     Raises ValueError if [start, end] extends outside
     [CONTROL_START, CONTROL_END] -- the archive has no data past
@@ -177,21 +273,23 @@ def build_polymarket_panel(
 
     category_map = category_map or {}
 
-    markets_lf = pl.scan_parquet(markets_path)
-    markets_columns = markets_lf.collect_schema().names()
+    markets_schema = pl.scan_parquet(markets_path).collect_schema()
+    markets_columns = markets_schema.names()
     market_id_col = _detect_column(markets_columns, MARKET_ID_CANDIDATES)
     outcome_col = _detect_column(markets_columns, OUTCOME_CANDIDATES)
+    outcome_list_col = _detect_column(markets_columns, OUTCOME_LIST_CANDIDATES) if outcome_col is None else None
     resolved_ts_col = _detect_column(markets_columns, RESOLVED_TS_CANDIDATES)
     category_col = _detect_column(markets_columns, CATEGORY_CANDIDATES)
-    if market_id_col is None or outcome_col is None or resolved_ts_col is None:
+    if market_id_col is None or (outcome_col is None and outcome_list_col is None) or resolved_ts_col is None:
         raise ValueError(
             "could not detect required markets.parquet columns "
-            f"(market_id={market_id_col}, outcome={outcome_col}, resolved_ts={resolved_ts_col}); "
-            "extend the candidate-name lists in this module -- see the [VERIFY] docstring note."
+            f"(market_id={market_id_col}, outcome={outcome_col or outcome_list_col}, "
+            f"resolved_ts={resolved_ts_col}); extend the candidate-name lists in this "
+            "module -- see the [VERIFY] docstring note."
         )
 
-    quant_lf = pl.scan_parquet(quant_path)
-    quant_columns = quant_lf.collect_schema().names()
+    quant_schema = pl.scan_parquet(quant_path).collect_schema()
+    quant_columns = quant_schema.names()
     quant_market_id_col = _detect_column(quant_columns, MARKET_ID_CANDIDATES)
     price_col = _detect_column(quant_columns, PRICE_CANDIDATES)
     trade_ts_col = _detect_column(quant_columns, TRADE_TS_CANDIDATES)
@@ -202,34 +300,57 @@ def build_polymarket_panel(
             "extend the candidate-name lists in this module -- see the [VERIFY] docstring note."
         )
 
-    markets_select = [
-        pl.col(market_id_col).cast(pl.String).alias("market_id"),
-        pl.col(outcome_col).alias("_outcome_raw"),
-        pl.col(resolved_ts_col).alias("_resolved_ts_raw"),
-    ]
-    if category_col is not None:
-        markets_select.append(pl.col(category_col).cast(pl.String).alias("_category_raw"))
-    markets_filtered = markets_lf.select(markets_select)
+    outcome_raw_col = outcome_col if outcome_col is not None else outcome_list_col
+    market_id_ident = _quote_ident(market_id_col)
+    outcome_ident = _quote_ident(outcome_raw_col)
+    resolved_ident = _quote_ident(resolved_ts_col)
+    quant_market_id_ident = _quote_ident(quant_market_id_col)
+    price_ident = _quote_ident(price_col)
+    trade_ts_ident = _quote_ident(trade_ts_col)
 
-    quant_filtered = quant_lf.select([
-        pl.col(quant_market_id_col).cast(pl.String).alias("market_id"),
-        pl.col(price_col).cast(pl.Float64).alias("_price_raw"),
-        pl.col(trade_ts_col).alias("_trade_ts_raw"),
-    ])
+    resolved_epoch_sql = _epoch_sql(markets_schema[resolved_ts_col], resolved_ident)
+    trade_epoch_sql = _epoch_sql(quant_schema[trade_ts_col], f"t.{trade_ts_ident}")
+    category_select = f", {_quote_ident(category_col)}::VARCHAR AS _category_raw" if category_col is not None else ""
+    category_out = ", m._category_raw" if category_col is not None else ""
 
-    joined = markets_filtered.join(quant_filtered, on="market_id", how="inner")
-    collected = joined.collect(engine="streaming")
+    query = f"""
+    WITH in_window_markets AS (
+        SELECT {market_id_ident}::VARCHAR AS market_id,
+               {outcome_ident} AS _outcome_raw,
+               {resolved_epoch_sql} AS _resolved_epoch
+               {category_select}
+        FROM read_parquet(?)
+        WHERE {resolved_epoch_sql} BETWEEN ? AND ?
+    ),
+    last_trade AS (
+        SELECT t.{quant_market_id_ident}::VARCHAR AS market_id,
+               t.{price_ident}::DOUBLE AS _price_raw,
+               {trade_epoch_sql} AS _trade_epoch,
+               row_number() OVER (
+                   PARTITION BY t.{quant_market_id_ident} ORDER BY {trade_epoch_sql} DESC
+               ) AS rn
+        FROM read_parquet(?) AS t
+        JOIN in_window_markets m ON m.market_id = t.{quant_market_id_ident}::VARCHAR
+        WHERE {trade_epoch_sql} <= m._resolved_epoch
+    )
+    SELECT m.market_id, m._outcome_raw, m._resolved_epoch{category_out},
+           lt._price_raw, lt._trade_epoch
+    FROM in_window_markets m
+    JOIN last_trade lt ON lt.market_id = m.market_id AND lt.rn = 1
+    """
+    con = duckdb.connect()
+    joined = con.execute(query, [str(markets_path), start, end, str(quant_path)]).pl()
+
+    if joined.is_empty():
+        return pl.DataFrame(schema=PANEL_SCHEMA)
 
     records: list[dict[str, Any]] = []
-    for row in collected.iter_rows(named=True):
-        resolved_epoch = _to_epoch(row["_resolved_ts_raw"])
-        if resolved_epoch is None or not (start <= resolved_epoch <= end):
-            continue
-        outcome = _outcome_to_float(row["_outcome_raw"])
+    for row in joined.iter_rows(named=True):
+        raw_outcome = row["_outcome_raw"]
+        if outcome_col is None:
+            raw_outcome = _parse_outcome_prices_first(raw_outcome)
+        outcome = _outcome_to_float(raw_outcome)
         if outcome is None:
-            continue
-        trade_epoch = _to_epoch(row["_trade_ts_raw"])
-        if trade_epoch is None or trade_epoch > resolved_epoch:
             continue
         price = row["_price_raw"]
         if price is None or not (0.0 < price < 1.0):
@@ -238,34 +359,15 @@ def build_polymarket_panel(
         records.append({
             "ticker": row["market_id"], "event_ticker": row["market_id"],
             "lookback_day": 0, "category": category_map.get(raw_category) if raw_category else None,
-            "close_time_epoch": resolved_epoch, "side": "yes",
+            "close_time_epoch": int(row["_resolved_epoch"]), "side": "yes",
             "y": outcome, "p": price, "source": "polymarket_archive",
-            "_trade_epoch": trade_epoch,
         })
 
     if not records:
         return pl.DataFrame(schema=PANEL_SCHEMA)
 
-    # Last trade at-or-before resolution, per market -- if quant.parquet
-    # carries multiple trades per market (expected; it's a trade tape, not
-    # a one-row-per-market snapshot), keep only the latest.
     df = pl.DataFrame(records)
-    df = df.sort("_trade_epoch").group_by("ticker", maintain_order=False).last()
     return df.select(list(PANEL_SCHEMA.keys())).cast(PANEL_SCHEMA)
-
-
-def _to_epoch(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, datetime):
-        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    try:
-        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
-    except ValueError:
-        return None
 
 
 @dataclass

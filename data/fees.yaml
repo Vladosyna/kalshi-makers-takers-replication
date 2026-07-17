@@ -41,27 +41,48 @@
 #   own data/fee_schedule.yaml (sourced there from kalshi.com/fee-schedule as
 #   of 2026-07-07): "maker fee (rests on the book) is 25% of that [taker]".
 #
-#   [VERIFY] Effective date: set here to 2025-05-01 on the strength of BDW's
-#   own "after April 2025" dating, corroborated by a CFTC self-certification
-#   filing titled "description and terms of kalshi's 2025 market maker
-#   program" submitted 2025-04-21
-#   (cftc.gov/filings/orgrules/rules04212519494.pdf) -- self-certified rule
-#   changes typically take effect on a stated date shortly after filing,
-#   consistent with a program submitted 2025-04-21 taking effect in May
-#   2025. This is NOT a verbatim date read off the filing's own effective-
-#   date field: the filing is a compressed/encoded PDF that every available
-#   extraction tool in this environment (WebFetch's summarizer, the PDF
-#   viewer MCP, `strings` against the raw bytes) failed to render as
-#   readable text. Before this fee row is used for any real R2 net-of-cost
-#   number, re-verify the exact effective date directly against the filing
-#   (a human opening the PDF, or a proper PDF-text-extraction pass) --
-#   flagged explicitly per spec S3's own warning that this file is the
-#   single most error-prone input in the whole replication.
+#   [VERIFY] Effective date -- UPDATED 2026-07-17, still not conclusively
+#   pinned to a primary source, but the earlier blocker (couldn't extract
+#   PDF text at all) is resolved and replaced by a more specific gap:
 #
-#   No evidence of a LATER maker-rate revision (2025-05-01 -> present) was
-#   found in this research pass; only one maker row exists below. This is a
-#   documented absence-of-evidence, not a claim that no later revision
-#   exists -- re-check before relying on it for the R2 window's later months.
+#   pypdf (not WebFetch/the PDF-viewer-MCP/`strings`, all of which failed
+#   in an earlier pass) DID successfully extract
+#   cftc.gov/filings/orgrules/rules04212519494.pdf this time. It reads:
+#   "DESCRIPTION AND TERMS OF KALSHI'S 2025 MARKET MAKER PROGRAM", filed
+#   2025-04-21, "effective May 3, 2025, and continues until May 3, 2027".
+#   BUT this filing describes an OPT-IN, per-participant incentive scheme
+#   (members sign a Form Market Maker Agreement, elect covered products in
+#   Schedule I, take on quoting obligations in Schedule II, and receive
+#   "predetermined incentives" in exchange) -- structurally NOT the same
+#   thing as a blanket per-fill maker fee applied to every resting order
+#   market-wide, which is what BDW's paper and this repo's maker/taker
+#   return decomposition actually need. Read in full; no per-fill fee rate
+#   (like the 0.0175 figure below) appears anywhere in its 2 pages.
+#
+#   Checked and ruled out as the source of the general per-fill maker fee:
+#     - CFTC rules01132513688.pdf (2025-01-13, effective 2025-01-28): a
+#       volume-based FEE REBATE program, unrelated to maker/taker roles.
+#     - CFTC rules05022520607.pdf / rules05022520613.pdf (2025-05-02, same
+#       content under two filing IDs, 155pp): a 40.6(a) rulebook amendment
+#       removing the FCM-dual-trading-account prohibition -- unrelated.
+#     - kalshi.com/fee-schedule via the Wayback Machine (snapshots
+#       2025-04-02 and 2025-06-06, spanning the boundary): both snapshots
+#       are the bare Next.js app shell with no server-rendered content --
+#       the actual fee numbers load client-side and were never captured.
+#     - kalshi.com/fee-schedule and kalshi.com/regulatory/notices directly:
+#       blocked by a Vercel bot-protection checkpoint on every fetch
+#       attempt (curl and WebFetch alike) during this research pass.
+#
+#   Net effect: the maker RATE (0.0175, 25% of taker) remains
+#   multi-source-corroborated and unchanged from the prior pass. The
+#   EFFECTIVE DATE (2025-05-01) is still an inference from BDW's own
+#   "after April 2025" wording, not a verbatim date read off a primary
+#   fee-schedule document -- re-verify before any real R2 net-of-cost
+#   number depends on the exact day (a human checking Kalshi's regulatory
+#   notices page directly, past its bot-protection, is the most direct
+#   next step; the CFTC filing index has more Kalshi org-rule filings
+#   than were exhausted in this pass, e.g. rules07012525155.pdf, 2025-07,
+#   Rulebook v1.18, not yet read).
 version: 1
 schedule:
   - effective_from: "2022-09-22"
