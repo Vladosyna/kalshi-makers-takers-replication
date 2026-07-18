@@ -9,18 +9,23 @@ kalshi:
   # than trusting the docs alone (guardrail: verify, don't infer).
   base_url: "https://external-api.kalshi.com/trade-api/v2"
   rate_limit:
-    # Raised 2026-07-16 to Kalshi's own documented ceiling (spec S3: "<=5
-    # req/s sustained, documented ceiling ~10") for the real collection
-    # run -- this is the maximum polite rate, not an override of it: going
-    # higher risks 429s, which cost more in backoff than staying at the
-    # ceiling ever saves. Kalshi's public/unauthenticated limit is itself
-    # undocumented (only authenticated tiers are published), so 10 is our
-    # own read of "the ceiling," not a number Kalshi states for this tier.
+    # Lowered back 2026-07-18: the 2026-07-16 bump to the documented
+    # ceiling (10 req/s, burst 20) produced persistent, repeated 429s
+    # during real collection -- high concurrency (20 concurrent series in
+    # discover_historical_series, 40-way sub-window splits in ad hoc
+    # workarounds) bursts past what Kalshi's public/unauthenticated tier
+    # actually tolerates even though the aggregate rate through one shared
+    # TokenBucket stays at the configured number on paper. Back to spec
+    # S3's own conservative baseline ("<=5 req/s sustained") rather than
+    # the ceiling -- politeness over raw throughput; the resumable
+    # checkpoints (live_window_scan_state, series_scan_state,
+    # pass2_progress) mean a slower sustained rate costs wall-clock time,
+    # not correctness or progress.
     # Deliberately run ONE fetch process at a time against this budget --
     # pass1 and pass2 each open their own TokenBucket, so running both
-    # concurrently would double the effective rate past the ceiling.
-    requests_per_second: 10
-    burst: 20
+    # concurrently would double the effective rate past this ceiling.
+    requests_per_second: 5
+    burst: 10
   # Step Zero's own discovery step finds these; ships empty since real
   # tickers aren't known until Step Zero runs. Once found, worth pinning
   # here so reruns are deterministic instead of re-discovering a (possibly
