@@ -231,6 +231,54 @@ def test_discover_historical_series_resumable_via_max_series_this_run(tmp_path):
     assert stats2["series_remaining"] == 0
 
 
+class _FakeFlakySeriesClient:
+    """FAILS (a stand-in for an exhausted-retry 429/504, both real and
+    observed live) raises on FLAKY's 2nd page, after its 1st page's market
+    was already found -- STABLE completes normally in the same batch."""
+
+    def __init__(self):
+        self.series = [KalshiSeries.model_validate({"ticker": "FLAKY", "category": "Weather"}),
+                       KalshiSeries.model_validate({"ticker": "STABLE", "category": "Economics"})]
+
+    async def list_series(self, category=None, limit=200):
+        return self.series
+
+    async def list_historical_markets(self, tickers=None, event_ticker=None,
+                                       series_ticker=None, cursor=None, limit=100):
+        window_epoch = pass1.R1_START + 3600
+        if series_ticker == "FLAKY":
+            if cursor is None:
+                return [_market("FLAKY-p1", window_epoch)], "p2"
+            raise RuntimeError("simulated exhausted-retry failure (429/504)")
+        if series_ticker == "STABLE":
+            return [_market("STABLE-window", window_epoch)], None
+        return [], None
+
+
+def test_discover_historical_series_one_failure_does_not_lose_others_progress(tmp_path):
+    """The real bug this guards: without return_exceptions=True, FLAKY's
+    exception used to cancel STABLE's still-in-flight coroutine too, even
+    though STABLE would have completed cleanly on its own."""
+    conn = db.connect(tmp_path / "t.db")
+    client = _FakeFlakySeriesClient()
+    stats = asyncio.run(pass1.discover_historical_series(client, conn))
+    assert stats["series_failed_this_run"] == 1
+
+    # STABLE completed despite FLAKY's sibling failure in the same gather().
+    stable_state = db.get_series_scan_state(conn, "STABLE")
+    assert stable_state["status"] == "done"
+    assert conn.execute("SELECT COUNT(*) FROM markets WHERE ticker='STABLE-window'").fetchone()[0] == 1
+
+    # FLAKY's page-1 progress is checkpointed, not lost, despite the page-2 failure.
+    flaky_state = db.get_series_scan_state(conn, "FLAKY")
+    assert flaky_state["status"] == "in_progress"
+    assert flaky_state["pages_fetched"] == 1
+    assert flaky_state["last_cursor"] == "p2"
+    assert conn.execute("SELECT COUNT(*) FROM markets WHERE ticker='FLAKY-p1'").fetchone()[0] == 1
+
+    assert stats["series_remaining"] == 1  # FLAKY still pending for a later call
+
+
 # ---------------------------------------------------------------------------
 # resolve_series_and_category
 # ---------------------------------------------------------------------------

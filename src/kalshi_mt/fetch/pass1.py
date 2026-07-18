@@ -202,48 +202,73 @@ async def discover_historical_series(
             ticker, cursor, pages_so_far = row["series_ticker"], row["last_cursor"], row["pages_fetched"]
             found_in_series = 0
             reached_before = False
+            # Checkpointed every page (not just once at the end) -- a
+            # request failure partway through a 20-page scan used to lose
+            # every page already fetched for this series, since the only
+            # upsert_series_scan_state call was after the loop. Confirmed
+            # live: with 20 concurrent series and a real, persistent 429
+            # rate, this was the actual bottleneck behind repeated
+            # kmt fetch pass1 restarts making only slow progress -- most of
+            # each restart's in-flight work for THIS series was thrown away
+            # on any single failed request, not just the failing one.
             for _ in range(max_pages_per_series):
                 markets, next_cursor = await client.list_historical_markets(
                     series_ticker=ticker, cursor=cursor, limit=1000
                 )
                 pages_so_far += 1
-                if not markets:
-                    break
-                close_epochs: list[int] = []
-                for m in markets:
-                    row_dict = _market_to_row(m, "historical")
-                    ce = row_dict["close_time_epoch"]
-                    if ce is not None:
-                        close_epochs.append(ce)
-                    if ce is not None and start_ts <= ce < end_ts:
-                        db.upsert_market(conn, row_dict)
-                        found_in_series += 1
-                # Pages are reverse-chronological (empirically confirmed,
-                # Phase 1): once a page's newest row already predates the
-                # window, every later page for this series is even older.
-                if close_epochs and max(close_epochs) < start_ts:
-                    reached_before = True
-                    break
-                if not next_cursor:
-                    break
-                cursor = next_cursor
-            db.upsert_series_scan_state(conn, {
-                "series_ticker": ticker, "status": "done", "pages_fetched": pages_so_far,
-                "markets_found_in_window": found_in_series,
-                "reached_before_window": int(reached_before), "last_cursor": cursor,
-            })
-            conn.commit()
+                stop = not markets
+                if markets:
+                    close_epochs: list[int] = []
+                    for m in markets:
+                        row_dict = _market_to_row(m, "historical")
+                        ce = row_dict["close_time_epoch"]
+                        if ce is not None:
+                            close_epochs.append(ce)
+                        if ce is not None and start_ts <= ce < end_ts:
+                            db.upsert_market(conn, row_dict)
+                            found_in_series += 1
+                    # Pages are reverse-chronological (empirically confirmed,
+                    # Phase 1): once a page's newest row already predates the
+                    # window, every later page for this series is even older.
+                    if close_epochs and max(close_epochs) < start_ts:
+                        reached_before = True
+                        stop = True
+                    elif not next_cursor:
+                        stop = True
+                    else:
+                        cursor = next_cursor
+                db.upsert_series_scan_state(conn, {
+                    "series_ticker": ticker, "status": "done" if stop else "in_progress",
+                    "pages_fetched": pages_so_far, "markets_found_in_window": found_in_series,
+                    "reached_before_window": int(reached_before), "last_cursor": cursor,
+                })
+                conn.commit()
+                if stop:
+                    return found_in_series
+            # max_pages_per_series exhausted without a natural stop -- the
+            # last iteration's checkpoint already left status='in_progress',
+            # resuming from `cursor` on a later call.
             return found_in_series
 
-    per_series_found = await asyncio.gather(*[_scan_series(row) for row in pending])
+    # return_exceptions=True is the actual fix for the observed failure
+    # mode: without it, ANY one series hitting an exhausted-retry error
+    # (429/504/etc, all real and observed live) cancels every other
+    # in-flight sibling task in this asyncio.gather batch too -- losing
+    # their progress even though each already checkpoints per-page above,
+    # since a cancelled coroutine never reaches its own next checkpoint
+    # write. With this, one bad series degrades to "stays in_progress,
+    # retried on the next call" instead of taking the whole batch down.
+    results = await asyncio.gather(*[_scan_series(row) for row in pending], return_exceptions=True)
     series_processed = len(pending)
-    markets_found_total = sum(per_series_found)
+    series_failed = sum(1 for r in results if isinstance(r, BaseException))
+    markets_found_total = sum(r for r in results if not isinstance(r, BaseException))
 
     remaining = conn.execute(
         "SELECT COUNT(*) FROM series_scan_state WHERE status IN ('pending', 'in_progress')"
     ).fetchone()[0]
     return {
         "series_processed_this_run": series_processed,
+        "series_failed_this_run": series_failed,
         "markets_found_this_run": markets_found_total,
         "series_remaining": remaining,
     }
