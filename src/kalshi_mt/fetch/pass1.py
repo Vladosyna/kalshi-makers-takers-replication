@@ -510,18 +510,15 @@ async def run_pass1(
         client, conn, batch_size=series_resolution_batch_size, min_volume_fp=min_volume_fp
     )
 
-    query = (
+    base_query = (
         "SELECT ticker, event_ticker, close_time_epoch FROM markets "
         "WHERE close_time_epoch IS NOT NULL "
         "AND ticker NOT IN (SELECT ticker FROM price_panel)"
     )
-    params: list[Any] = []
+    extra_params: list[Any] = []
     if min_volume_fp is not None:
-        query += " AND volume_fp >= ?"
-        params.append(min_volume_fp)
-    rows = conn.execute(query, params).fetchall()
-    if market_processing_limit is not None:
-        rows = rows[:market_processing_limit]
+        base_query += " AND volume_fp >= ?"
+        extra_params.append(min_volume_fp)
 
     # Concurrent, bounded panel+quote fetch -- each market's ~12-13 calls
     # (up to 11 boundary-tick trade lookups + one candlestick lookup) were
@@ -539,15 +536,45 @@ async def run_pass1(
             )
             return panel_result["rows_written"], int(quote_result["has_quote"])
 
-    per_market_results = await asyncio.gather(*[_process_market(row) for row in rows])
-    panel_written = sum(r[0] for r in per_market_results)
-    quotes_written = sum(r[1] for r in per_market_results)
+    # Chunked, keyset-paginated (ticker > last-seen, not OFFSET) rather than
+    # one `fetchall()` -- confirmed live (2026-07-19): with the R1+R2
+    # universe's real scale, ~2.5 MILLION markets pass this WHERE clause at
+    # once, and one `fetchall()` plus one `asyncio.gather()` over all of
+    # them (millions of Row objects and Task objects materialized before
+    # any work starts) drove a single collector process to ~4.75GB RSS --
+    # a real, confirmed risk on a machine that has already hit OOM twice
+    # this project. A keyset cursor on `ticker` (not the "NOT IN
+    # price_panel" subquery itself) is what guarantees forward progress:
+    # fetch_price_panel/fetch_closing_quote legitimately write NOTHING for
+    # a market with zero trades found at or before its close_time_epoch
+    # (confirmed real, not just theoretical -- exercised directly by this
+    # module's own test fixtures), so relying on "already-processed rows
+    # drop out of the NOT IN filter" to make each chunk different would
+    # infinite-loop on exactly that case.
+    _PANEL_QUOTE_CHUNK_SIZE = 2000
+    panel_written = 0
+    quotes_written = 0
+    markets_processed = 0
+    last_ticker = ""
+    while market_processing_limit is None or markets_processed < market_processing_limit:
+        budget = _PANEL_QUOTE_CHUNK_SIZE
+        if market_processing_limit is not None:
+            budget = min(budget, market_processing_limit - markets_processed)
+        chunk_query = base_query + " AND ticker > ? ORDER BY ticker LIMIT ?"
+        rows = conn.execute(chunk_query, [*extra_params, last_ticker, budget]).fetchall()
+        if not rows:
+            break
+        per_market_results = await asyncio.gather(*[_process_market(row) for row in rows])
+        panel_written += sum(r[0] for r in per_market_results)
+        quotes_written += sum(r[1] for r in per_market_results)
+        markets_processed += len(rows)
+        last_ticker = rows[-1]["ticker"]
 
     return {
         "live_discovery": live_stats,
         "historical_discovery": hist_stats,
         "series_resolution": resolve_stats,
-        "markets_processed": len(rows),
+        "markets_processed": markets_processed,
         "panel_rows_written": panel_written,
         "quotes_written": quotes_written,
     }
