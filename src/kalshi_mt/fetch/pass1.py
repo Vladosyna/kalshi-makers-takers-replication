@@ -171,7 +171,7 @@ async def discover_live_window(
 async def discover_historical_series(
     client: KalshiClient, conn, start_ts: int = R1_START, end_ts: int = LIVE_METADATA_FLOOR,
     max_series_this_run: int | None = None, max_pages_per_series: int = 20,
-    max_concurrent_series: int = 5,
+    max_concurrent_series: int = 20,
 ) -> dict[str, int]:
     """Different series are fully independent -- their cursor walks run
     CONCURRENTLY, bounded by `max_concurrent_series` (same latency-bound
@@ -278,7 +278,7 @@ async def discover_historical_series(
 
 async def resolve_series_and_category(
     client: KalshiClient, conn, batch_size: int | None = 500,
-    min_volume_fp: float | None = None, max_concurrent: int = 5,
+    min_volume_fp: float | None = None, max_concurrent: int = 20,
 ) -> dict[str, int]:
     """`min_volume_fp` restricts resolution to markets that could plausibly
     clear R1/R2's own $1k volume filter (fetch/pass2.py's MIN_VOLUME_FP) --
@@ -474,7 +474,7 @@ async def run_pass1(
     live_max_pages: int | None = None,
     series_resolution_batch_size: int | None = 500,
     min_volume_fp: float | None = 1000.0,
-    panel_quote_concurrency: int = 5,
+    panel_quote_concurrency: int = 20,
 ) -> dict[str, Any]:
     """Discovery (live sweep + historical series scan) -> series/category
     resolution -> price-panel + closing-quote fetch for every discovered
