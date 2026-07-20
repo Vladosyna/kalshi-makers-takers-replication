@@ -9,23 +9,26 @@ kalshi:
   # than trusting the docs alone (guardrail: verify, don't infer).
   base_url: "https://external-api.kalshi.com/trade-api/v2"
   rate_limit:
-    # Lowered back 2026-07-18: the 2026-07-16 bump to the documented
-    # ceiling (10 req/s, burst 20) produced persistent, repeated 429s
-    # during real collection -- high concurrency (20 concurrent series in
-    # discover_historical_series, 40-way sub-window splits in ad hoc
-    # workarounds) bursts past what Kalshi's public/unauthenticated tier
-    # actually tolerates even though the aggregate rate through one shared
-    # TokenBucket stays at the configured number on paper. Back to spec
-    # S3's own conservative baseline ("<=5 req/s sustained") rather than
-    # the ceiling -- politeness over raw throughput; the resumable
-    # checkpoints (live_window_scan_state, series_scan_state,
-    # pass2_progress) mean a slower sustained rate costs wall-clock time,
-    # not correctness or progress.
+    # Lowered 2026-07-18 from the documented ceiling (10 req/s, burst 20)
+    # after it produced persistent, repeated 429s during real collection
+    # -- high concurrency (20 concurrent series in discover_historical_series,
+    # 40-way sub-window splits in ad hoc workarounds) bursts past what
+    # Kalshi's public/unauthenticated tier actually tolerates even though
+    # the aggregate rate through one shared TokenBucket stays at the
+    # configured number on paper.
+    # Nudged up 2026-07-20: with collection now steady-state in the
+    # panel/quote fetch phase (not the concurrency-heavy discovery/ad hoc
+    # workaround phases that caused the original 429 storm), measured 429
+    # rate at 5 req/s was ~0.4% (11/2891 requests) -- real headroom, not
+    # just theoretical. 7 req/s / burst 14 keeps the same proportional
+    # margin below the problematic 10/20 ceiling while cutting wall-clock
+    # time; re-measure the 429 rate after restart and back off if it
+    # climbs back toward the pre-2026-07-18 pattern.
     # Deliberately run ONE fetch process at a time against this budget --
     # pass1 and pass2 each open their own TokenBucket, so running both
     # concurrently would double the effective rate past this ceiling.
-    requests_per_second: 5
-    burst: 10
+    requests_per_second: 7
+    burst: 14
   # Step Zero's own discovery step finds these; ships empty since real
   # tickers aren't known until Step Zero runs. Once found, worth pinning
   # here so reruns are deterministic instead of re-discovering a (possibly
