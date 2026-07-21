@@ -335,6 +335,26 @@ def test_resolve_series_and_category_min_volume_filters_thin_markets(tmp_path):
     assert thin[0] is None
 
 
+def test_resolve_series_and_category_min_open_duration_filters_short_markets(tmp_path):
+    """The 24h open-duration filter must scope resolution too, not just the
+    panel/quote loop -- category is consumed only for in-scope markets, all
+    of which must clear >=24h, so resolving hourly-reset sub-markets is pure
+    wasted GET /events budget (2026-07-21 pipeline audit)."""
+    conn = db.connect(tmp_path / "t.db")
+    db.upsert_market(conn, {"ticker": "LONG", "event_ticker": "EVT-1", "open_time_epoch": 0, "close_time_epoch": 100_000})
+    db.upsert_market(conn, {"ticker": "SHORT", "event_ticker": "EVT-1", "open_time_epoch": 97_000, "close_time_epoch": 100_000})
+    conn.commit()
+
+    client = _FakeResolveClient()
+    stats = asyncio.run(pass1.resolve_series_and_category(client, conn, min_open_duration_s=86_400.0))
+    assert stats["resolved_this_run"] == 1
+
+    long_row = conn.execute("SELECT series_ticker FROM markets WHERE ticker='LONG'").fetchone()
+    short_row = conn.execute("SELECT series_ticker FROM markets WHERE ticker='SHORT'").fetchone()
+    assert long_row[0] == "KXHIGHNY"
+    assert short_row[0] is None
+
+
 # ---------------------------------------------------------------------------
 # fetch_price_panel
 # ---------------------------------------------------------------------------
@@ -409,6 +429,51 @@ def test_fetch_price_panel_no_trades_at_all_writes_nothing(tmp_path):
     assert result["rows_written"] == 0
 
 
+class _FakeHistoricalOnlyPanelClient:
+    """Serves every trade ONLY via the historical family; live /markets/trades
+    always returns empty (the pre-cutoff-market case). Records each family's
+    call count so a test can prove fetch_price_panel probes live at most once
+    (on the closing-day trade) rather than on every lookback day."""
+
+    def __init__(self, trades):
+        self.trades = sorted(trades, key=lambda t: -t[0])
+        self.live_calls = 0
+        self.historical_calls = 0
+
+    async def get_trades(self, ticker=None, min_ts=None, max_ts=None, cursor=None, limit=100):
+        self.live_calls += 1
+        return [], None
+
+    async def get_historical_trades(self, ticker=None, min_ts=None, max_ts=None, cursor=None, limit=100):
+        self.historical_calls += 1
+        for epoch, tid, price in self.trades:
+            if epoch <= max_ts:
+                return [KalshiTrade.model_validate({
+                    "trade_id": tid, "ticker": ticker, "yes_price_dollars": str(price),
+                    "created_time": _iso(epoch),
+                })], None
+        return [], None
+
+
+def test_fetch_price_panel_probes_live_family_once_for_historical_market(tmp_path):
+    """A pre-cutoff market's trades live only in the historical family. The
+    closing-day probe determines that once; the 10 lookback days must then
+    prefer historical and NOT pay a wasted empty live round-trip each
+    (2026-07-21 audit -- ~2x trade calls otherwise). So live is probed
+    exactly once (day 0) while historical answers all 11 days."""
+    conn = db.connect(tmp_path / "t.db")
+    db.upsert_market(conn, {"ticker": "A-1"})
+    close_epoch = et_to_epoch(datetime(2023, 6, 15, 20, 0, 0, tzinfo=ET))
+    t0_et = epoch_to_et(close_epoch)
+    trades = [(et_to_epoch(t0_et - timedelta(days=day)), f"t{day}", 0.5) for day in range(11)]
+
+    client = _FakeHistoricalOnlyPanelClient(trades)
+    result = asyncio.run(pass1.fetch_price_panel(client, conn, "A-1", close_epoch))
+    assert result["rows_written"] == 11
+    assert client.live_calls == 1        # only the day-0 family probe, not one per lookback day
+    assert client.historical_calls == 11  # day 0 + 10 lookback days all answered here
+
+
 # ---------------------------------------------------------------------------
 # fetch_closing_quote
 # ---------------------------------------------------------------------------
@@ -424,8 +489,10 @@ class _FakeQuoteClient:
     def __init__(self, live_candles=None, historical_candles=None):
         self.live_candles = live_candles or []
         self.historical_candles = historical_candles or []
+        self.event_calls = []
 
     async def get_event(self, event_ticker):
+        self.event_calls.append(event_ticker)
         return KalshiEvent.model_validate({"event_ticker": event_ticker, "series_ticker": "SER-1"})
 
     async def get_candlesticks(self, series_ticker, ticker, start_ts, end_ts, period_interval=1440):
@@ -456,6 +523,36 @@ def test_fetch_closing_quote_falls_back_to_historical(tmp_path):
     assert result["has_quote"] is True
     row = conn.execute("SELECT source FROM quotes WHERE ticker='A-1'").fetchone()
     assert row[0] == "historical"
+
+
+def test_fetch_closing_quote_reuses_stored_series_ticker_skips_get_event(tmp_path):
+    """resolve_series_and_category already persists markets.series_ticker
+    before the panel/quote loop runs; passing it in must skip the redundant
+    GET /events round-trip (2026-07-21 audit) -- get_event is a fallback for
+    the not-yet-resolved remainder only."""
+    conn = db.connect(tmp_path / "t.db")
+    db.upsert_market(conn, {"ticker": "A-1"})
+    client = _FakeQuoteClient(live_candles=[_candle(1000, 0.45, 0.47)])
+    result = asyncio.run(
+        pass1.fetch_closing_quote(client, conn, "A-1", "EVT-1", 2000, series_ticker="KXHIGHNY")
+    )
+    assert result["has_quote"] is True
+    assert client.event_calls == []  # never called -- series_ticker was already known
+    row = conn.execute("SELECT source FROM quotes WHERE ticker='A-1'").fetchone()
+    assert row[0] == "live"
+
+
+def test_fetch_closing_quote_falls_back_to_get_event_when_series_ticker_unresolved(tmp_path):
+    """series_ticker=None (not yet resolved) must still fall back to
+    get_event -- the reuse optimization must never break the unresolved case."""
+    conn = db.connect(tmp_path / "t.db")
+    db.upsert_market(conn, {"ticker": "A-1"})
+    client = _FakeQuoteClient(live_candles=[_candle(1000, 0.45, 0.47)])
+    result = asyncio.run(
+        pass1.fetch_closing_quote(client, conn, "A-1", "EVT-1", 2000, series_ticker=None)
+    )
+    assert result["has_quote"] is True
+    assert client.event_calls == ["EVT-1"]
 
 
 def test_fetch_closing_quote_no_quote_anywhere_still_writes_a_row(tmp_path):
@@ -575,6 +672,35 @@ def test_run_pass1_default_open_duration_skips_markets_missing_open_time(tmp_pat
 
     assert "NOOPEN" not in client.trade_fetch_calls
     assert stats["markets_processed"] == 0
+
+
+def test_run_pass1_resumes_orphaned_market_missing_only_its_quote(tmp_path):
+    """A market crashed between fetch_price_panel's commit and
+    fetch_closing_quote's commit is left with price_panel rows but no
+    quotes row. The OLD resume key (`NOT IN price_panel`) permanently
+    excluded such orphans -- confirmed live, 97 existed by 2026-07-21 -- so
+    their closing quote was never fetched again. The resume key must be
+    `NOT IN quotes` (the row fetch_closing_quote always writes last) so the
+    orphan is re-selected and its quote gets fetched; the panel replay
+    (idempotent upsert) is harmless."""
+    conn = db.connect(tmp_path / "t.db")
+    db.upsert_market(conn, {
+        "ticker": "ORPHAN", "open_time_epoch": 0, "close_time_epoch": 100_000, "volume_fp": 5000.0,
+    })
+    # Simulate the crash: a price_panel row exists, but no quotes row.
+    db.upsert_price_panel_row(conn, {
+        "ticker": "ORPHAN", "lookback_day": 0, "trade_id": "t0",
+        "yes_price_dollars": 0.5, "created_time": "2023-01-01T00:00:00Z", "source": "historical",
+    })
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM quotes WHERE ticker='ORPHAN'").fetchone()[0] == 0
+
+    client = _NoOpDiscoveryClient()
+    stats = asyncio.run(pass1.run_pass1(client, conn, max_series_this_run=0))
+
+    assert "ORPHAN" in client.trade_fetch_calls  # re-processed, not silently skipped forever
+    assert stats["markets_processed"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM quotes WHERE ticker='ORPHAN'").fetchone()[0] == 1
 
 
 def test_run_pass1_min_open_duration_none_processes_short_markets(tmp_path):

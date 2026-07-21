@@ -276,18 +276,52 @@ async def discover_historical_series(
 
 # -- Sub-phase C: series_ticker + category resolution ------------------------
 
+def _scope_predicate(
+    min_volume_fp: float | None, min_open_duration_s: float | None,
+) -> tuple[str, list[Any]]:
+    """The shared "$1k volume + >=24h open" scoping predicate for the two
+    EXPENSIVE per-market Pass-1 phases (category resolution and the
+    panel/quote fetch). Kept in ONE place so the two phases can never drift
+    apart -- exactly the bug the 2026-07-21 pipeline audit found when only
+    the panel/quote loop carried the 24h guard. Mirrors fetch/pass2.py's
+    select_in_scope_tickers and r1/filters.py: volume_fp >= threshold, then
+    both timestamps present and (close - open) >= threshold. A NULL
+    open_time_epoch fails the guard and is skipped, matching pass2 -- the 24h
+    check is unverifiable without an open time, so such a market is out of
+    scope. Each filter is independently optional (pass None to disable, e.g.
+    a verification run that wants every discovered market)."""
+    sql = ""
+    params: list[Any] = []
+    if min_volume_fp is not None:
+        sql += " AND volume_fp >= ?"
+        params.append(min_volume_fp)
+    if min_open_duration_s is not None:
+        sql += " AND open_time_epoch IS NOT NULL AND (close_time_epoch - open_time_epoch) >= ?"
+        params.append(min_open_duration_s)
+    return sql, params
+
+
 async def resolve_series_and_category(
     client: KalshiClient, conn, batch_size: int | None = 500,
-    min_volume_fp: float | None = None, max_concurrent: int = 20,
+    min_volume_fp: float | None = None, min_open_duration_s: float | None = None,
+    max_concurrent: int = 20,
 ) -> dict[str, int]:
-    """`min_volume_fp` restricts resolution to markets that could plausibly
-    clear R1/R2's own $1k volume filter (fetch/pass2.py's MIN_VOLUME_FP) --
-    a live sweep across the full R1+R2 window can discover many hundreds of
-    thousands of markets (most of them thin sports/crypto sub-markets that
-    will never survive Phase 3's filters), and every resolution is one
-    GET /events call. Filtering here, not just at Pass 2's in-scope
-    selection, is what keeps a real collection run from spending days
-    resolving series/category for markets no downstream phase will ever use.
+    """`min_volume_fp` and `min_open_duration_s` restrict resolution to
+    markets that could plausibly clear R1/R2's own $1k volume and >=24h open
+    filters (fetch/pass2.py's MIN_VOLUME_FP / MIN_OPEN_SECONDS) -- a live
+    sweep across the full R1+R2 window can discover many hundreds of
+    thousands of markets (most of them thin, hourly-reset sports/crypto
+    sub-markets that will never survive Phase 3's filters), and every
+    resolution is one GET /events call. Filtering here, not just at Pass 2's
+    in-scope selection, is what keeps a real collection run from spending
+    days resolving series/category for markets no downstream phase will ever
+    use. Both filters must be applied together for the same reason the
+    panel/quote loop applies both: category is consumed only for in-scope
+    markets, and every in-scope market must clear BOTH $1k volume and >=24h
+    open, so scoping resolution to that set still resolves a strict superset
+    of what R2's category-composition analysis needs. The 24h guard reads
+    only discovery-metadata epochs, so it has no dependency on resolution
+    having run.
 
     The GET /events calls for distinct event_tickers run CONCURRENTLY
     (bounded by `max_concurrent`, sharing the client's TokenBucket) -- one
@@ -300,12 +334,12 @@ async def resolve_series_and_category(
     all_series = await client.list_series(limit=100_000)
     category_by_series = {s.ticker: s.category for s in all_series}
 
-    query = "SELECT ticker, event_ticker FROM markets WHERE series_ticker IS NULL AND event_ticker IS NOT NULL"
-    params: list[Any] = []
-    if min_volume_fp is not None:
-        query += " AND volume_fp >= ?"
-        params.append(min_volume_fp)
-    rows = conn.execute(query, params).fetchall()
+    scope_sql, scope_params = _scope_predicate(min_volume_fp, min_open_duration_s)
+    query = (
+        "SELECT ticker, event_ticker FROM markets "
+        "WHERE series_ticker IS NULL AND event_ticker IS NOT NULL" + scope_sql
+    )
+    rows = conn.execute(query, scope_params).fetchall()
     if batch_size is not None:
         rows = rows[:batch_size]
 
@@ -332,31 +366,41 @@ async def resolve_series_and_category(
         )
         resolved += 1
     conn.commit()
-    remaining_query = "SELECT COUNT(*) FROM markets WHERE series_ticker IS NULL AND event_ticker IS NOT NULL"
-    remaining_params: list[Any] = []
-    if min_volume_fp is not None:
-        remaining_query += " AND volume_fp >= ?"
-        remaining_params.append(min_volume_fp)
-    remaining = conn.execute(remaining_query, remaining_params).fetchone()[0]
+    remaining_query = (
+        "SELECT COUNT(*) FROM markets "
+        "WHERE series_ticker IS NULL AND event_ticker IS NOT NULL" + scope_sql
+    )
+    remaining = conn.execute(remaining_query, scope_params).fetchone()[0]
     return {"resolved_this_run": resolved, "remaining": remaining}
 
 
 # -- Sub-phase D: boundary-tick price panel -----------------------------------
 
 async def _last_trade_before(
-    client: KalshiClient, ticker: str, max_ts: int,
+    client: KalshiClient, ticker: str, max_ts: int, prefer: str = "live",
 ) -> tuple[KalshiTrade, str] | tuple[None, None]:
-    """The single most recent trade at/before max_ts, live then historical
-    fallback. Assumes (confirmed empirically, Phase 1) both /markets/trades
-    and /historical/trades return results newest-first by default, so
-    limit=1 with max_ts set gives exactly this trade directly -- no need to
-    fetch a whole day's tape just to find its last row."""
-    trades, _ = await client.get_trades(ticker=ticker, max_ts=max_ts, limit=1)
-    if trades:
-        return trades[0], "live"
-    trades, _ = await client.get_historical_trades(ticker=ticker, max_ts=max_ts, limit=1)
-    if trades:
-        return trades[0], "historical"
+    """The single most recent trade at/before max_ts, trying the `prefer`
+    endpoint family first and the other as fallback. Assumes (confirmed
+    empirically, Phase 1) both /markets/trades and /historical/trades return
+    results newest-first by default, so limit=1 with max_ts set gives exactly
+    this trade directly -- no need to fetch a whole day's tape just to find
+    its last row.
+
+    `prefer` exists because the live /markets/trades endpoint only serves the
+    most recent ~60 days; for a market whose trades predate that window every
+    live probe returns empty and pays a wasted round-trip before the
+    historical fallback. A single market's 10-day panel never straddles the
+    ~60-day live/historical cutoff, so fetch_price_panel determines the family
+    once on the closing-day trade and passes it as `prefer` for all 10
+    lookback days -- halving the trade calls for pre-cutoff markets while the
+    fallback still covers the rare market whose window brackets the cutoff.
+    Same family-once idea pass2.fetch_full_tape_for_market already uses."""
+    families = ("live", "historical") if prefer == "live" else ("historical", "live")
+    for family in families:
+        fetch = client.get_trades if family == "live" else client.get_historical_trades
+        trades, _ = await fetch(ticker=ticker, max_ts=max_ts, limit=1)
+        if trades:
+            return trades[0], family
     return None, None
 
 
@@ -388,7 +432,10 @@ async def fetch_price_panel(
         ref_et = shift_et_calendar_days(t0_et, day)
         ref_epoch = et_to_epoch(ref_et)
         day_start_epoch = et_to_epoch(et_day_start(ref_et))
-        trade, source = await _last_trade_before(client, ticker, ref_epoch)
+        # Closing-day trade already revealed which family answers for this
+        # market; try it first, the other stays a fallback for the rare
+        # ~60-day live/historical straddle.
+        trade, source = await _last_trade_before(client, ticker, ref_epoch, prefer=source0)
         if trade is None:
             continue
         trade_epoch = iso_to_epoch(trade.created_time)
@@ -408,9 +455,16 @@ async def fetch_price_panel(
 
 async def fetch_closing_quote(
     client: KalshiClient, conn, ticker: str, event_ticker: str | None, close_time_epoch: int,
+    series_ticker: str | None = None,
 ) -> dict[str, bool]:
     """One closing candlestick per market -- the input to spec S1's final
     spread<=20c filter (Phase 3). Live then historical fallback.
+
+    The live-candlestick endpoint is keyed on series_ticker. When the caller
+    already has it (resolve_series_and_category persists markets.series_ticker
+    before this phase runs), it is passed in and the redundant GET
+    /events/{event_ticker} round-trip is skipped -- that lookup is only a
+    fallback for markets not yet resolved (series_ticker still NULL).
 
     ALWAYS writes a `quotes` row, even when neither endpoint family has a
     quote -- previously this returned early and wrote nothing, which made
@@ -426,15 +480,17 @@ async def fetch_closing_quote(
     start_ts, end_ts = close_time_epoch - 86_400, close_time_epoch
     candles = []
     source = "live"
-    if event_ticker:
+    resolved_series = series_ticker
+    if resolved_series is None and event_ticker:
         event = await client.get_event(event_ticker)
-        if event and event.series_ticker:
-            try:
-                candles = await client.get_candlesticks(
-                    event.series_ticker, ticker, start_ts, end_ts, period_interval=60
-                )
-            except Exception:
-                candles = []
+        resolved_series = event.series_ticker if event else None
+    if resolved_series:
+        try:
+            candles = await client.get_candlesticks(
+                resolved_series, ticker, start_ts, end_ts, period_interval=60
+            )
+        except Exception:
+            candles = []
     if not candles:
         source = "historical"
         try:
@@ -523,28 +579,16 @@ async def run_pass1(
         client, conn, max_series_this_run=max_series_this_run
     )
     resolve_stats = await resolve_series_and_category(
-        client, conn, batch_size=series_resolution_batch_size, min_volume_fp=min_volume_fp
+        client, conn, batch_size=series_resolution_batch_size,
+        min_volume_fp=min_volume_fp, min_open_duration_s=min_open_duration_s,
     )
 
+    scope_sql, extra_params = _scope_predicate(min_volume_fp, min_open_duration_s)
     base_query = (
-        "SELECT ticker, event_ticker, close_time_epoch FROM markets "
+        "SELECT ticker, event_ticker, series_ticker, close_time_epoch FROM markets "
         "WHERE close_time_epoch IS NOT NULL "
-        "AND ticker NOT IN (SELECT ticker FROM price_panel)"
+        "AND ticker NOT IN (SELECT ticker FROM quotes)" + scope_sql
     )
-    extra_params: list[Any] = []
-    if min_volume_fp is not None:
-        base_query += " AND volume_fp >= ?"
-        extra_params.append(min_volume_fp)
-    if min_open_duration_s is not None:
-        # BDW's "market open >= 24h" filter -- byte-for-byte the same two
-        # guards fetch/pass2.py uses (both timestamps present, then the
-        # duration check), so a market fetched here is exactly one Pass 2's
-        # in-scope selection can also use. A NULL open_time_epoch fails the
-        # first guard and is skipped, matching pass2: the 24h check is
-        # unverifiable without an open time, so such a market is out of
-        # scope, not silently treated as long-lived.
-        base_query += " AND open_time_epoch IS NOT NULL AND (close_time_epoch - open_time_epoch) >= ?"
-        extra_params.append(min_open_duration_s)
 
     # Concurrent, bounded panel+quote fetch -- each market's ~12-13 calls
     # (up to 11 boundary-tick trade lookups + one candlestick lookup) were
@@ -558,7 +602,8 @@ async def run_pass1(
         async with panel_quote_semaphore:
             panel_result = await fetch_price_panel(client, conn, row["ticker"], row["close_time_epoch"])
             quote_result = await fetch_closing_quote(
-                client, conn, row["ticker"], row["event_ticker"], row["close_time_epoch"]
+                client, conn, row["ticker"], row["event_ticker"], row["close_time_epoch"],
+                series_ticker=row["series_ticker"],
             )
             return panel_result["rows_written"], int(quote_result["has_quote"])
 
@@ -569,14 +614,23 @@ async def run_pass1(
     # them (millions of Row objects and Task objects materialized before
     # any work starts) drove a single collector process to ~4.75GB RSS --
     # a real, confirmed risk on a machine that has already hit OOM twice
-    # this project. A keyset cursor on `ticker` (not the "NOT IN
-    # price_panel" subquery itself) is what guarantees forward progress:
-    # fetch_price_panel/fetch_closing_quote legitimately write NOTHING for
-    # a market with zero trades found at or before its close_time_epoch
-    # (confirmed real, not just theoretical -- exercised directly by this
-    # module's own test fixtures), so relying on "already-processed rows
-    # drop out of the NOT IN filter" to make each chunk different would
-    # infinite-loop on exactly that case.
+    # this project.
+    #
+    # The resume predicate is `NOT IN quotes`, NOT `NOT IN price_panel`:
+    # fetch_closing_quote writes a `quotes` row LAST and ALWAYS (even when no
+    # quote is found), whereas fetch_price_panel writes NOTHING for a
+    # zero-trade market and commits in a SEPARATE transaction first. Keying
+    # on price_panel therefore (a) permanently orphaned any market crashed
+    # between the two commits -- it had price_panel rows but no quote, so
+    # `NOT IN price_panel` excluded it forever and its closing quote was
+    # never fetched (a real, silent coverage loss: 97 such orphans existed
+    # by 2026-07-21) -- and (b) re-fetched every zero-trade market on every
+    # restart (never in price_panel). Keying on `quotes`, the last+always
+    # write, fixes both: an interrupted market still lacks its quote row so
+    # it is re-selected, and upsert_price_panel_row is idempotent so the
+    # panel replay is harmless. The keyset cursor on `ticker` (not the
+    # subquery) is still what guarantees forward progress within a run: it
+    # advances every chunk regardless of whether a row landed in quotes.
     _PANEL_QUOTE_CHUNK_SIZE = 2000
     panel_written = 0
     quotes_written = 0

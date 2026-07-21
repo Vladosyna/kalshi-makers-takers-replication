@@ -150,6 +150,14 @@ def fetch_pass1(
                      "markets that would never survive Phase 3 anyway (confirmed live, 2026-07: "
                      "576k+ from the live sweep alone); pass 0 to disable and process everything."
     ),
+    min_open_hours: float = typer.Option(
+        24.0, help="Skip series/category resolution AND the panel/quote fetch for markets open "
+                   "fewer than this many hours -- matches R1/R2's own hourly-reset exclusion "
+                   "(fetch/pass2.py's MIN_OPEN_SECONDS). Confirmed live, 2026-07-21: of ~2.56M "
+                   "markets clearing $1k volume, only ~510k also clear 24h; the rest are "
+                   "hourly-reset crypto/index sub-markets no downstream phase uses. Pass 0 to "
+                   "disable and process every volume-qualifying market regardless of duration."
+    ),
 ) -> None:
     """Universe discovery (live sweep + historical series scan) + boundary-tick
     price panel + closing quotes. Resumable -- safe to re-run; each sub-phase
@@ -162,6 +170,7 @@ def fetch_pass1(
 
     config = load_config()
     min_volume_fp = None if min_volume <= 0 else min_volume
+    min_open_duration_s = None if min_open_hours <= 0 else min_open_hours * 3600.0
 
     async def _run():
         bucket = TokenBucket(
@@ -174,7 +183,7 @@ def fetch_pass1(
             return await run_pass1(
                 client, conn, max_series_this_run=max_series, market_processing_limit=market_limit,
                 live_max_pages=live_max_pages, series_resolution_batch_size=resolve_batch_size,
-                min_volume_fp=min_volume_fp,
+                min_volume_fp=min_volume_fp, min_open_duration_s=min_open_duration_s,
             )
         finally:
             await client.aclose()
