@@ -24,11 +24,16 @@ kalshi:
     # margin below the problematic 10/20 ceiling while cutting wall-clock
     # time; re-measure the 429 rate after restart and back off if it
     # climbs back toward the pre-2026-07-18 pattern.
+    # Nudged up again 2026-07-21: measured 429 at 7 req/s was ~0.5%
+    # (3/603) in steady-state panel/quote fetch -- still ample headroom.
+    # 8 req/s / burst 16 stays clearly under the problematic 10/20 ceiling
+    # (a deliberately small step, not a jump to the ceiling that burned us
+    # on 2026-07-16); re-measure after restart and back off if 429s climb.
     # Deliberately run ONE fetch process at a time against this budget --
     # pass1 and pass2 each open their own TokenBucket, so running both
     # concurrently would double the effective rate past this ceiling.
-    requests_per_second: 7
-    burst: 14
+    requests_per_second: 8
+    burst: 16
   # Step Zero's own discovery step finds these; ships empty since real
   # tickers aren't known until Step Zero runs. Once found, worth pinning
   # here so reruns are deterministic instead of re-discovering a (possibly
