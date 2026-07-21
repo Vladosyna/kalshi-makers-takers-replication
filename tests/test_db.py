@@ -18,6 +18,60 @@ def test_connect_is_idempotent(tmp_path):
     conn2.close()
 
 
+def test_connect_migrates_markets_table_missing_new_columns(tmp_path):
+    """The `markets` table already existed with real data before
+    settlement_value_dollars/last_price_dollars were added (2026-07-21
+    audit) -- CREATE TABLE IF NOT EXISTS is a no-op against it, so connect()
+    must explicitly ALTER TABLE the missing columns in, and do so safely on
+    every subsequent connect() (not just the first)."""
+    import sqlite3
+    path = tmp_path / "old_schema.db"
+    # Simulate a pre-migration database: the real CREATE TABLE, minus the
+    # two new columns -- must keep every column the SCHEMA script's own
+    # CREATE INDEX IF NOT EXISTS statements reference (close_time_epoch,
+    # series_ticker, in_r1_window, in_r2_window), since those indexes run
+    # against this table unconditionally on every connect().
+    raw = sqlite3.connect(path)
+    raw.execute("""
+        CREATE TABLE markets (
+          ticker TEXT PRIMARY KEY, event_ticker TEXT, series_ticker TEXT, category TEXT,
+          status TEXT, result TEXT, open_time TEXT, open_time_epoch INTEGER,
+          close_time TEXT, close_time_epoch INTEGER, settlement_ts TEXT, volume_fp REAL,
+          metadata_source TEXT, in_r1_window INTEGER DEFAULT 0, in_r2_window INTEGER DEFAULT 0,
+          first_seen_ts TEXT, last_synced_ts TEXT
+        )
+    """)
+    raw.execute("INSERT INTO markets (ticker, volume_fp) VALUES ('PRE-1', 42.0)")
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(path)  # must not raise -- ALTER TABLE ADD COLUMN, not CREATE
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(markets)")}
+    assert "settlement_value_dollars" in cols
+    assert "last_price_dollars" in cols
+    row = conn.execute("SELECT ticker, volume_fp FROM markets WHERE ticker='PRE-1'").fetchone()
+    assert row[0] == "PRE-1" and row[1] == 42.0  # pre-existing data untouched
+    conn.close()
+
+    conn2 = db.connect(path)  # re-running the migration on an already-migrated table must not error
+    cols2 = {row[1] for row in conn2.execute("PRAGMA table_info(markets)")}
+    assert "settlement_value_dollars" in cols2
+    conn2.close()
+
+
+def test_upsert_market_persists_settlement_and_last_price(tmp_path):
+    conn = db.connect(tmp_path / "test.db")
+    db.upsert_market(conn, {
+        "ticker": "ABC-1", "settlement_value_dollars": 1.0, "last_price_dollars": 0.97,
+    })
+    conn.commit()
+    row = conn.execute(
+        "SELECT settlement_value_dollars, last_price_dollars FROM markets WHERE ticker='ABC-1'"
+    ).fetchone()
+    assert row[0] == 1.0
+    assert row[1] == 0.97
+
+
 def test_upsert_market_preserves_first_seen_ts(tmp_path):
     conn = db.connect(tmp_path / "test.db")
     db.upsert_market(conn, {"ticker": "ABC-1", "close_time_epoch": 100, "in_r1_window": 1})

@@ -429,6 +429,28 @@ def test_fetch_price_panel_no_trades_at_all_writes_nothing(tmp_path):
     assert result["rows_written"] == 0
 
 
+def test_fetch_price_panel_skips_whole_panel_when_no_trade_on_closing_et_day(tmp_path):
+    """'closing day' = calendar ET date of close_time_epoch (construction
+    pin, spec S3). If the only trade at/before close_time_epoch actually
+    falls on an EARLIER ET calendar day (no trade during the closing day
+    itself), day 0 must be skipped -- not silently mislabeled as the closing
+    price -- exactly the skip-no-backfill discipline days 1-10 already use.
+    Since every lookback day is walked back from t0, an invalid day-0
+    anchor would re-anchor the whole panel onto the wrong calendar, so the
+    whole market's panel is skipped (2026-07-21 audit)."""
+    conn = db.connect(tmp_path / "t.db")
+    db.upsert_market(conn, {"ticker": "A-1"})
+    close_epoch = et_to_epoch(datetime(2023, 6, 15, 20, 0, 0, tzinfo=ET))
+    # Only trade is from the PRIOR ET calendar day -- no trade on close's own day.
+    stale_trade_epoch = et_to_epoch(datetime(2023, 6, 14, 23, 0, 0, tzinfo=ET))
+    client = _FakePanelClient([(stale_trade_epoch, "t_stale", 0.5)])
+
+    result = asyncio.run(pass1.fetch_price_panel(client, conn, "A-1", close_epoch))
+    assert result["rows_written"] == 0
+    rows = conn.execute("SELECT COUNT(*) FROM price_panel WHERE ticker='A-1'").fetchone()[0]
+    assert rows == 0
+
+
 class _FakeHistoricalOnlyPanelClient:
     """Serves every trade ONLY via the historical family; live /markets/trades
     always returns empty (the pre-cutoff-market case). Records each family's

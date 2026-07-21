@@ -78,6 +78,13 @@ def _market_to_row(m: KalshiMarket, source: str) -> dict[str, Any]:
         "close_time": m.close_time, "close_time_epoch": close_epoch,
         "settlement_ts": m.settlement_ts, "volume_fp": m.volume_fp, "metadata_source": source,
         "in_r1_window": in_r1, "in_r2_window": in_r2,
+        # Not yet consumed by r1/filters.py's 63-mismatch check -- CLAUDE.md's
+        # own placeholder inventory still lists the exact settlement-price
+        # field as unpinned. Captured now (2026-07-21 audit) so the data
+        # exists once that pin is made, rather than needing a metadata
+        # re-fetch of the whole universe later.
+        "settlement_value_dollars": m.settlement_value_dollars,
+        "last_price_dollars": m.last_price_dollars,
     }
 
 
@@ -413,13 +420,28 @@ async def fetch_price_panel(
     close_time itself) -- construction pin from the plan: skip a lookback
     day with no trade STRICTLY within that ET calendar day, never backfill
     from an earlier day just because a bracketed query happened to return
-    one."""
+    one.
+
+    That same "closing day" = calendar ET date of the close timestamp
+    (construction pin, spec S3) applies to day 0 too: a trade found via
+    max_ts=close_time_epoch is not automatically ON the closing ET day --
+    for a market with no trade on that day, `_last_trade_before` happily
+    returns an earlier one. Days 1-10 already guard against exactly this
+    (trade_epoch < day_start_epoch => skip); day 0 must use the SAME guard
+    against close_time_epoch's own ET day, not skip it just because it's the
+    anchor. Skipping the whole panel (not just day 0) on failure is correct:
+    every lookback day is walked back from t0, so an invalid t0 would
+    silently re-anchor the entire 10-day window onto the wrong calendar
+    (2026-07-21 audit)."""
     trade0, source0 = await _last_trade_before(client, ticker, close_time_epoch)
     if trade0 is None:
         return {"rows_written": 0}
     t0_epoch = iso_to_epoch(trade0.created_time)
     if t0_epoch is None:
         return {"rows_written": 0}
+    close_day_start_epoch = et_to_epoch(et_day_start(epoch_to_et(close_time_epoch)))
+    if t0_epoch < close_day_start_epoch:
+        return {"rows_written": 0}  # no qualifying trade strictly within the closing ET day -- skip, no backfill
     db.upsert_price_panel_row(conn, {
         "ticker": ticker, "lookback_day": 0, "trade_id": trade0.trade_id,
         "yes_price_dollars": trade0.yes_price_dollars, "created_time": trade0.created_time,

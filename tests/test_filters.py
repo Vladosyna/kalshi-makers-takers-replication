@@ -103,6 +103,21 @@ def test_settlement_agreement_not_flagged(tmp_path):
     assert "settlement_last_trade_mismatch" not in r.reason_codes
 
 
+def test_missing_result_flagged_as_visible_exclusion(tmp_path):
+    """A stale/unsynced `result` (Pass 1's live sweep can leave it NULL for
+    older markets -- fetch/pass1.py's own docstring) must fail visibly here
+    with 'result_missing_or_invalid', not silently pass this gate only to
+    be invisibly dropped later by r1/panel.py's `WHERE result IN
+    ('yes','no')` -- an unattributed shortfall against BDW's 156,986
+    (2026-07-21 audit)."""
+    conn = db.connect(tmp_path / "t.db")
+    _seed(conn, "STALE", result=None)
+    r = apply_r1_filters(conn)[0]
+    assert r.passed is False
+    assert "result_missing_or_invalid" in r.reason_codes
+    assert "settlement_last_trade_mismatch" not in r.reason_codes
+
+
 def test_no_price_panel_row_does_not_trigger_mismatch(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     _seed(conn, "NOPANEL", result="yes", day0_price=None)

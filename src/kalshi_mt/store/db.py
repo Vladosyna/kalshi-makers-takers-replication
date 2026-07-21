@@ -44,6 +44,17 @@ CREATE TABLE IF NOT EXISTS markets (
   first_seen_ts TEXT,
   last_synced_ts TEXT
 );
+-- settlement_value_dollars / last_price_dollars: Kalshi's own reported
+-- settlement value and last-trade-price snapshot (api/kalshi.py's
+-- KalshiMarket parses both but a prior version of this schema didn't
+-- persist either). Added via _ensure_column below (not this
+-- CREATE-IF-NOT-EXISTS block) since the table already existed with real
+-- data before this migration -- ADD COLUMN is the only safe path on a
+-- populated table. Not yet consumed by r1/filters.py's 63-mismatch check:
+-- CLAUDE.md's own placeholder inventory still lists "exact
+-- settlement-price field behind the 63-mismatch filter" as unpinned, so
+-- this is groundwork (capture the data now so it exists when that pin is
+-- made), not a redefinition of the filter.
 CREATE INDEX IF NOT EXISTS idx_markets_close_time ON markets(close_time_epoch);
 CREATE INDEX IF NOT EXISTS idx_markets_series ON markets(series_ticker);
 CREATE INDEX IF NOT EXISTS idx_markets_r1 ON markets(in_r1_window);
@@ -188,6 +199,20 @@ CREATE INDEX IF NOT EXISTS idx_universe_log_reason ON universe_log(reason_code);
 """
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, coltype: str) -> None:
+    """Idempotent `ALTER TABLE ADD COLUMN` -- the SCHEMA string's own
+    CREATE TABLE IF NOT EXISTS is a no-op against a table that already
+    exists (e.g. `markets` with millions of rows from a prior schema
+    version), so a genuinely new column needs an explicit, guarded
+    migration rather than editing the CREATE TABLE block. Checked via
+    PRAGMA table_info rather than try/except on the duplicate-column error,
+    so it stays silent and correct on every connect(), not just the first
+    one after the column is introduced."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
     """Open (creating if needed) the database with schema applied."""
     path = Path(db_path)
@@ -200,6 +225,8 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=10000")
     conn.executescript(SCHEMA)
+    _ensure_column(conn, "markets", "settlement_value_dollars", "REAL")
+    _ensure_column(conn, "markets", "last_price_dollars", "REAL")
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)", (SCHEMA_VERSION,)
     )
@@ -217,10 +244,12 @@ def upsert_market(conn: sqlite3.Connection, row: dict) -> None:
         INSERT INTO markets (ticker, event_ticker, series_ticker, category, status, result,
                              open_time, open_time_epoch, close_time, close_time_epoch,
                              settlement_ts, volume_fp, metadata_source, in_r1_window, in_r2_window,
+                             settlement_value_dollars, last_price_dollars,
                              first_seen_ts, last_synced_ts)
         VALUES (:ticker, :event_ticker, :series_ticker, :category, :status, :result,
                 :open_time, :open_time_epoch, :close_time, :close_time_epoch, :settlement_ts,
-                :volume_fp, :metadata_source, :in_r1_window, :in_r2_window, :now, :now)
+                :volume_fp, :metadata_source, :in_r1_window, :in_r2_window,
+                :settlement_value_dollars, :last_price_dollars, :now, :now)
         ON CONFLICT(ticker) DO UPDATE SET
             event_ticker=excluded.event_ticker, series_ticker=excluded.series_ticker,
             category=excluded.category, status=excluded.status, result=excluded.result,
@@ -230,6 +259,8 @@ def upsert_market(conn: sqlite3.Connection, row: dict) -> None:
             volume_fp=excluded.volume_fp, metadata_source=excluded.metadata_source,
             in_r1_window=MAX(markets.in_r1_window, excluded.in_r1_window),
             in_r2_window=MAX(markets.in_r2_window, excluded.in_r2_window),
+            settlement_value_dollars=excluded.settlement_value_dollars,
+            last_price_dollars=excluded.last_price_dollars,
             last_synced_ts=excluded.last_synced_ts
         """,
         {
@@ -237,6 +268,7 @@ def upsert_market(conn: sqlite3.Connection, row: dict) -> None:
             "result": None, "open_time": None, "open_time_epoch": None, "close_time": None,
             "close_time_epoch": None, "settlement_ts": None, "volume_fp": None,
             "metadata_source": None, "in_r1_window": 0, "in_r2_window": 0,
+            "settlement_value_dollars": None, "last_price_dollars": None,
             **row, "now": now_utc_iso(),
         },
     )

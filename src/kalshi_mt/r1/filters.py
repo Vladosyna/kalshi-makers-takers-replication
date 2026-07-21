@@ -53,7 +53,20 @@ def apply_r1_filters(conn, window: str = "r1") -> list[FilterResult]:
     won't resolve by fetching more, per Step Zero Check 5's own finding).
     Neither is silently skipped -- incomplete Pass 1 coverage should be
     visible in the reconciliation counts, split by which of the two it is
-    (reconcile.py's coverage_gap_breakdown), not swallowed into one bucket."""
+    (reconcile.py's coverage_gap_breakdown), not swallowed into one bucket.
+
+    A market whose stored `result` is neither 'yes' nor 'no' -- Pass 1's
+    live sweep upserts status/result fields that are documented as
+    "frequently stale for older markets" (fetch/pass1.py's module
+    docstring), and no re-derivation from trade/settlement evidence is
+    implemented yet (2026-07-21 audit finding, deferred pending a design
+    decision on what "re-derive" means) -- now fails on
+    'result_missing_or_invalid' rather than silently passing here only to
+    be dropped later, invisibly, by r1/panel.py's `WHERE result IN
+    ('yes','no')`. This does not change which contracts end up in the
+    final panel; it makes an already-happening drop visible in
+    universe_log/reconcile.py's coverage_gap_breakdown instead of an
+    unattributed shortfall against BDW's 156,986."""
     window_column = {"r1": "in_r1_window", "r2": "in_r2_window"}[window]
     rows = conn.execute(
         f"""
@@ -87,9 +100,12 @@ def apply_r1_filters(conn, window: str = "r1") -> list[FilterResult]:
             reasons.append("missing_open_or_close_time")
         elif (row["close_time_epoch"] - row["open_time_epoch"]) < MIN_OPEN_SECONDS:
             reasons.append("open_below_24h")
-        implied = _implied_side(day0_price.get(row["ticker"]))
-        if row["result"] and implied and row["result"] != implied:
-            reasons.append("settlement_last_trade_mismatch")
+        if row["result"] not in ("yes", "no"):
+            reasons.append("result_missing_or_invalid")
+        else:
+            implied = _implied_side(day0_price.get(row["ticker"]))
+            if implied and row["result"] != implied:
+                reasons.append("settlement_last_trade_mismatch")
         results.append(FilterResult(ticker=row["ticker"], passed=not reasons, reason_codes=reasons))
     return results
 
