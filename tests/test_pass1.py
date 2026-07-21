@@ -514,10 +514,13 @@ class _NoOpDiscoveryClient:
         return []
 
 
+# Both markets below open 100_000s (>24h) before close so they clear the
+# default open-duration filter -- these two tests isolate the VOLUME gate,
+# so their fixtures must not also trip the duration gate.
 def test_run_pass1_default_min_volume_skips_thin_markets_panel_quote_fetch(tmp_path):
     conn = db.connect(tmp_path / "t.db")
-    db.upsert_market(conn, {"ticker": "THICK", "close_time_epoch": 1000, "volume_fp": 5000.0})
-    db.upsert_market(conn, {"ticker": "THIN", "close_time_epoch": 1000, "volume_fp": 10.0})
+    db.upsert_market(conn, {"ticker": "THICK", "open_time_epoch": 0, "close_time_epoch": 100_000, "volume_fp": 5000.0})
+    db.upsert_market(conn, {"ticker": "THIN", "open_time_epoch": 0, "close_time_epoch": 100_000, "volume_fp": 10.0})
     conn.commit()
 
     client = _NoOpDiscoveryClient()
@@ -530,8 +533,8 @@ def test_run_pass1_default_min_volume_skips_thin_markets_panel_quote_fetch(tmp_p
 
 def test_run_pass1_min_volume_none_processes_every_market(tmp_path):
     conn = db.connect(tmp_path / "t.db")
-    db.upsert_market(conn, {"ticker": "THICK", "close_time_epoch": 1000, "volume_fp": 5000.0})
-    db.upsert_market(conn, {"ticker": "THIN", "close_time_epoch": 1000, "volume_fp": 10.0})
+    db.upsert_market(conn, {"ticker": "THICK", "open_time_epoch": 0, "close_time_epoch": 100_000, "volume_fp": 5000.0})
+    db.upsert_market(conn, {"ticker": "THIN", "open_time_epoch": 0, "close_time_epoch": 100_000, "volume_fp": 10.0})
     conn.commit()
 
     client = _NoOpDiscoveryClient()
@@ -540,3 +543,51 @@ def test_run_pass1_min_volume_none_processes_every_market(tmp_path):
     assert "THICK" in client.trade_fetch_calls
     assert "THIN" in client.trade_fetch_calls
     assert stats["markets_processed"] == 2
+
+
+def test_run_pass1_default_open_duration_skips_hourly_reset_markets(tmp_path):
+    # LONG opens 100_000s (>24h) before close; SHORT opens 3_000s (<24h)
+    # before close -- the hourly-reset crypto/index shape BDW's "open >= 24h"
+    # filter exists to drop. Both clear the volume gate, so this isolates
+    # the duration gate.
+    conn = db.connect(tmp_path / "t.db")
+    db.upsert_market(conn, {"ticker": "LONG", "open_time_epoch": 0, "close_time_epoch": 100_000, "volume_fp": 5000.0})
+    db.upsert_market(conn, {"ticker": "SHORT", "open_time_epoch": 97_000, "close_time_epoch": 100_000, "volume_fp": 5000.0})
+    conn.commit()
+
+    client = _NoOpDiscoveryClient()
+    stats = asyncio.run(pass1.run_pass1(client, conn, max_series_this_run=0))
+
+    assert "LONG" in client.trade_fetch_calls
+    assert "SHORT" not in client.trade_fetch_calls
+    assert stats["markets_processed"] == 1
+
+
+def test_run_pass1_default_open_duration_skips_markets_missing_open_time(tmp_path):
+    # A NULL open_time_epoch fails the first guard and is skipped, matching
+    # pass2: the 24h check is unverifiable without an open time.
+    conn = db.connect(tmp_path / "t.db")
+    db.upsert_market(conn, {"ticker": "NOOPEN", "close_time_epoch": 100_000, "volume_fp": 5000.0})
+    conn.commit()
+
+    client = _NoOpDiscoveryClient()
+    stats = asyncio.run(pass1.run_pass1(client, conn, max_series_this_run=0))
+
+    assert "NOOPEN" not in client.trade_fetch_calls
+    assert stats["markets_processed"] == 0
+
+
+def test_run_pass1_min_open_duration_none_processes_short_markets(tmp_path):
+    # The escape hatch: min_open_duration_s=None fetches even a sub-24h
+    # market (for a targeted verification run).
+    conn = db.connect(tmp_path / "t.db")
+    db.upsert_market(conn, {"ticker": "SHORT", "open_time_epoch": 97_000, "close_time_epoch": 100_000, "volume_fp": 5000.0})
+    conn.commit()
+
+    client = _NoOpDiscoveryClient()
+    stats = asyncio.run(
+        pass1.run_pass1(client, conn, max_series_this_run=0, min_open_duration_s=None)
+    )
+
+    assert "SHORT" in client.trade_fetch_calls
+    assert stats["markets_processed"] == 1

@@ -474,6 +474,7 @@ async def run_pass1(
     live_max_pages: int | None = None,
     series_resolution_batch_size: int | None = 500,
     min_volume_fp: float | None = 1000.0,
+    min_open_duration_s: float | None = 86_400.0,
     panel_quote_concurrency: int = 20,
 ) -> dict[str, Any]:
     """Discovery (live sweep + historical series scan) -> series/category
@@ -501,7 +502,22 @@ async def run_pass1(
     universe_log/reconciliation coverage stays complete; only the
     EXPENSIVE per-market detail work is scoped down. Pass None to disable
     (process every discovered market) if a specific verification run
-    genuinely needs that."""
+    genuinely needs that.
+
+    `min_open_duration_s` (default 24h, mirroring fetch/pass2.py's
+    MIN_OPEN_SECONDS) applies BDW's "market open >= 24 hours" construction
+    filter (spec S1/S3: excludes the hourly-reset crypto/index series) to
+    the same expensive panel+quote fetch, with the identical two-guard SQL
+    pass2 uses (open_time_epoch IS NOT NULL AND close-open >= threshold).
+    Confirmed live 2026-07-21: of ~2.56M markets clearing the $1k volume
+    filter, only ~510k also clear the 24h filter -- the other ~2.05M are
+    hourly-reset sub-markets (KXBTC-<hour>, index resets) that Pass 2's
+    in-scope selection and r1/filters.py both discard anyway, so fetching
+    their price panel and closing quote is pure wasted API budget. Like
+    the volume filter this scopes ONLY the expensive per-market work, not
+    metadata discovery, so reconciliation coverage against BDW's 46,282
+    stays complete. Pass None to disable (e.g. to deliberately fetch a
+    short-duration market for a verification run)."""
     live_stats = await discover_live_window(client, conn, max_pages=live_max_pages)
     hist_stats = await discover_historical_series(
         client, conn, max_series_this_run=max_series_this_run
@@ -519,6 +535,16 @@ async def run_pass1(
     if min_volume_fp is not None:
         base_query += " AND volume_fp >= ?"
         extra_params.append(min_volume_fp)
+    if min_open_duration_s is not None:
+        # BDW's "market open >= 24h" filter -- byte-for-byte the same two
+        # guards fetch/pass2.py uses (both timestamps present, then the
+        # duration check), so a market fetched here is exactly one Pass 2's
+        # in-scope selection can also use. A NULL open_time_epoch fails the
+        # first guard and is skipped, matching pass2: the 24h check is
+        # unverifiable without an open time, so such a market is out of
+        # scope, not silently treated as long-lived.
+        base_query += " AND open_time_epoch IS NOT NULL AND (close_time_epoch - open_time_epoch) >= ?"
+        extra_params.append(min_open_duration_s)
 
     # Concurrent, bounded panel+quote fetch -- each market's ~12-13 calls
     # (up to 11 boundary-tick trade lookups + one candlestick lookup) were
