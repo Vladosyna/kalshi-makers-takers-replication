@@ -7,6 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from kalshi_mt.store import db
+from kalshi_mt.store.parquet import TradeStore
 
 
 def _epoch(y, m=1, d=1):
@@ -25,12 +26,17 @@ def _seed_r1_market(conn, ticker, category, close_epoch, price, result):
     conn.commit()
 
 
-def _seed_r2_market(conn, ticker, category, close_epoch, price, result):
-    """Passes apply_r1_filters(window='r2'): volume>=1000, spread<=0.2,
-    open>=24h, and day0_price/result must agree (no settlement mismatch)."""
+def _seed_r2_market(conn, ticker, category, close_epoch, price, result, *, trade_store, notional=5000.0):
+    """Passes apply_r1_filters(window='r2'): TRUE dollar volume>=1000
+    (2026-07-21 audit -- read from Pass 2's trade tape via
+    dollar_volume_by_ticker, not the old volume_fp contract-count proxy),
+    spread<=0.2, open>=24h, and day0_price/result must agree (no
+    settlement mismatch). pass2_progress must be 'done' -- otherwise the
+    market fails 'dollar_volume_not_yet_fetched' rather than being
+    evaluated on its actual notional."""
     db.upsert_market(conn, {
         "ticker": ticker, "event_ticker": f"{ticker}-EVT", "category": category,
-        "result": result, "volume_fp": 5000.0,
+        "result": result,
         "open_time_epoch": close_epoch - 2 * 86400, "close_time_epoch": close_epoch,
         "in_r2_window": 1,
     })
@@ -42,10 +48,20 @@ def _seed_r2_market(conn, ticker, category, close_epoch, price, result):
         "ticker": ticker, "lookback_day": 0, "trade_id": f"{ticker}-t0",
         "yes_price_dollars": price, "created_time": "2025-06-01T00:00:00Z", "source": "live",
     })
+    db.upsert_pass2_progress(conn, {
+        "ticker": ticker, "status": "done", "cursor": None, "source": "historical", "trade_count": 1,
+    })
+    trade_store.append([{
+        "trade_id": f"{ticker}-tape-0", "ticker": ticker,
+        "count_fp": notional / max(price, 0.01), "yes_price_dollars": price,
+        "no_price_dollars": round(1 - price, 4), "taker_outcome_side": "yes",
+        "taker_book_side": "yes", "taker_side": "yes",
+        "created_time": "2025-06-01T00:00:00Z", "is_block_trade": False, "source": "historical",
+    }])
     conn.commit()
 
 
-def _seed_full_fixture(conn):
+def _seed_full_fixture(conn, trade_store):
     # R1: 10 Weather markets, well-spread prices, mixed outcomes -- enough
     # n and price variance for fit_mz_regression to produce a real psi.
     for i in range(10):
@@ -57,10 +73,10 @@ def _seed_full_fixture(conn):
     # straddling the publication boundary (2025-09-08) -- 5 before, 5 after.
     for i in range(5):
         p = 0.55 + 0.08 * i  # 0.55 .. 0.87 -- result "yes"
-        _seed_r2_market(conn, f"R2-preP-{i}", "Weather", _epoch(2025, 6, 1) + i, p, "yes")
+        _seed_r2_market(conn, f"R2-preP-{i}", "Weather", _epoch(2025, 6, 1) + i, p, "yes", trade_store=trade_store)
     for i in range(5):
         p = 0.10 + 0.08 * i  # 0.10 .. 0.42 -- result "no"
-        _seed_r2_market(conn, f"R2-postP-{i}", "Weather", _epoch(2025, 10, 1) + i, p, "no")
+        _seed_r2_market(conn, f"R2-postP-{i}", "Weather", _epoch(2025, 10, 1) + i, p, "no", trade_store=trade_store)
 
 
 def _write_frozen_mix(path):
@@ -107,7 +123,7 @@ def test_r2_cli_end_to_end_produces_verdict(cli_env):
     from kalshi_mt import cli
 
     conn, tmp_path = cli_env
-    _seed_full_fixture(conn)
+    _seed_full_fixture(conn, TradeStore(tmp_path / "parquet"))
     conn.close()
     _write_frozen_mix(tmp_path / "data" / "frozen_2024_mix.json")
 
@@ -144,22 +160,29 @@ def test_r2_cli_end_to_end_produces_verdict(cli_env):
 
 
 def test_r2_cli_r2_filters_exclude_a_bad_market(cli_env):
-    """A market failing the R2 proxy filter (thin volume) must not reach
-    the regression -- confirms apply_and_log(window='r2') is actually
-    wired into the CLI, not just present in filters.py."""
+    """A market failing the R2 filter (thin real dollar volume) must not
+    reach the regression -- confirms apply_and_log(window='r2') is
+    actually wired into the CLI, not just present in filters.py. Marked
+    pass2_progress='done' with NO trade tape written, so
+    dollar_volume_by_ticker reports it as genuinely $0 notional (not
+    'not yet fetched')."""
     from kalshi_mt import cli
 
     conn, tmp_path = cli_env
-    _seed_full_fixture(conn)
+    trade_store = TradeStore(tmp_path / "parquet")
+    _seed_full_fixture(conn, trade_store)
     db.upsert_market(conn, {
         "ticker": "R2-thin", "event_ticker": "R2-thin-EVT", "category": "Weather",
-        "result": "yes", "volume_fp": 10.0,  # below MIN_VOLUME_FP
+        "result": "yes",
         "open_time_epoch": _epoch(2025, 6, 20) - 2 * 86400, "close_time_epoch": _epoch(2025, 6, 20),
         "in_r2_window": 1,
     })
     db.upsert_quote(conn, {
         "ticker": "R2-thin", "end_period_ts": _epoch(2025, 6, 20), "yes_bid_close": 0.58,
         "yes_ask_close": 0.62, "spread": 0.04, "source": "live",
+    })
+    db.upsert_pass2_progress(conn, {
+        "ticker": "R2-thin", "status": "done", "cursor": None, "source": "historical", "trade_count": 0,
     })
     conn.commit()
     conn.close()

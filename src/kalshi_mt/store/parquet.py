@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import duckdb
 import polars as pl
 
 from kalshi_mt.util import PROJECT_ROOT
@@ -102,3 +103,30 @@ class TradeStore:
         if df.is_empty():
             return df
         return df.filter(pl.col("ticker") == ticker)
+
+    def dollar_volume_by_ticker(self) -> dict[str, float]:
+        """Total dollar notional traded per ticker -- Sigma(count_fp *
+        yes_price_dollars) across every fill -- the input to r1/filters.py's
+        TRUE $1k volume gate (spec S1: "total traded volume at closure >=
+        $1,000", a dollar figure; Kalshi's own volume_fp field Pass 1/2 use
+        as a cheap SCOPING proxy is a CONTRACT COUNT, not notional, and
+        2026-07-21's audit confirmed count>=1000 admits markets with real
+        notional under $1000 whenever price<$1 -- exactly the tail bins the
+        FLB headline depends on).
+
+        Computed via DuckDB, not a polars .collect() (even with
+        engine="streaming"): this repo's own control/polymarket.py rewrite
+        found polars streaming memory-unsafe on a large parquet
+        aggregate/join on this machine (RSS climbed past 11GB and was still
+        growing when killed; DuckDB's equivalent query finished in ~13s) --
+        a plain groupby-sum is cheaper than that join, but DuckDB is the
+        proven-safe path for any whole-tape aggregate over Pass 2's
+        multi-million-row dataset, so it stays the default here too."""
+        if not self.months_on_disk():
+            return {}
+        query = (
+            "SELECT ticker, SUM(count_fp * yes_price_dollars) AS dollar_volume "
+            "FROM read_parquet(?) GROUP BY ticker"
+        )
+        result = duckdb.connect().execute(query, [str(self.base / "month=*" / "trades.parquet")]).pl()
+        return dict(zip(result["ticker"].to_list(), result["dollar_volume"].to_list()))

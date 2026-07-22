@@ -63,3 +63,36 @@ def test_read_range_missing_month_is_empty(tmp_path):
     store = TradeStore(tmp_path / "parquet")
     df = store.read_range(["2099-01"])
     assert df.is_empty()
+
+
+def test_dollar_volume_by_ticker_empty_store(tmp_path):
+    store = TradeStore(tmp_path / "parquet")
+    assert store.dollar_volume_by_ticker() == {}
+
+
+def test_dollar_volume_by_ticker_sums_count_times_price(tmp_path):
+    """The TRUE $-notional gate r1/filters.py's volume check needs
+    (2026-07-21 audit) -- Sigma(count_fp * yes_price_dollars) per ticker,
+    not Kalshi's own volume_fp contract count."""
+    store = TradeStore(tmp_path / "parquet")
+    store.append([
+        _trade("t1", ticker="ABC-1", count_fp=100.0, yes_price_dollars=0.5),   # $50
+        _trade("t2", ticker="ABC-1", count_fp=200.0, yes_price_dollars=0.25),  # $50
+        _trade("t3", ticker="XYZ-1", count_fp=10.0, yes_price_dollars=0.9),    # $9
+    ])
+    volumes = store.dollar_volume_by_ticker()
+    assert abs(volumes["ABC-1"] - 100.0) < 1e-9
+    assert abs(volumes["XYZ-1"] - 9.0) < 1e-9
+
+
+def test_dollar_volume_by_ticker_across_month_partitions(tmp_path):
+    """Trades for one ticker spread across multiple month partitions must
+    still sum to one total -- the aggregate reads every partition, not
+    just the most recent one."""
+    store = TradeStore(tmp_path / "parquet")
+    store.append([_trade("t1", ticker="ABC-1", count_fp=1000.0, yes_price_dollars=0.5,
+                          created_time="2022-12-30T17:15:45Z")])
+    store.append([_trade("t2", ticker="ABC-1", count_fp=1000.0, yes_price_dollars=0.5,
+                          created_time="2023-01-02T00:00:00Z")])
+    volumes = store.dollar_volume_by_ticker()
+    assert abs(volumes["ABC-1"] - 1000.0) < 1e-9

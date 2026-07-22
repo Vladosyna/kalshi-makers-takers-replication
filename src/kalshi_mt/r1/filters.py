@@ -39,7 +39,9 @@ def _implied_side(yes_price: float | None) -> str | None:
     return "yes" if yes_price >= 0.5 else "no"
 
 
-def apply_r1_filters(conn, window: str = "r1") -> list[FilterResult]:
+def apply_r1_filters(
+    conn, window: str = "r1", dollar_volume_by_ticker: dict[str, float] | None = None,
+) -> list[FilterResult]:
     """One row per market in the given window (`in_r1_window` or
     `in_r2_window`) that Pass 1 has reached at least once (has a markets
     row). Same filter thresholds for both windows -- analysis_plan.md S2's
@@ -66,14 +68,31 @@ def apply_r1_filters(conn, window: str = "r1") -> list[FilterResult]:
     ('yes','no')`. This does not change which contracts end up in the
     final panel; it makes an already-happening drop visible in
     universe_log/reconcile.py's coverage_gap_breakdown instead of an
-    unattributed shortfall against BDW's 156,986."""
+    unattributed shortfall against BDW's 156,986.
+
+    `dollar_volume_by_ticker` (store/parquet.py's TradeStore.
+    dollar_volume_by_ticker()) is the TRUE $1k volume gate (spec S1: dollar
+    notional), replacing the earlier proxy that thresholded Kalshi's own
+    `volume_fp` -- a CONTRACT COUNT, not dollars (2026-07-21 audit: since
+    every trade price is <$1, count>=1000 admits real notional under $1000,
+    concentrated in exactly the cheap tail bins the FLB headline depends
+    on). A market Pass 2 hasn't finished (no 'done' pass2_progress row)
+    fails 'dollar_volume_not_yet_fetched' (operational, mirrors the
+    spread_filter split) rather than being silently treated as below
+    threshold. Passing None (the default) falls back to the old
+    contract-count proxy against `volume_fp` -- an approximation, correct
+    only for a lightweight/preview call made before Pass 2 has run; the
+    production R1/R2 gate (cli.py's `build` command) always threads the
+    real dict through."""
     window_column = {"r1": "in_r1_window", "r2": "in_r2_window"}[window]
     rows = conn.execute(
         f"""
         SELECT m.ticker, m.volume_fp, m.open_time_epoch, m.close_time_epoch, m.result,
-               q.spread, (q.ticker IS NOT NULL) AS quote_attempted
+               q.spread, (q.ticker IS NOT NULL) AS quote_attempted,
+               p.status AS pass2_status
         FROM markets m
         LEFT JOIN quotes q ON q.ticker = m.ticker
+        LEFT JOIN pass2_progress p ON p.ticker = m.ticker
         WHERE m.{window_column} = 1
         """
     ).fetchall()
@@ -88,7 +107,12 @@ def apply_r1_filters(conn, window: str = "r1") -> list[FilterResult]:
     results = []
     for row in rows:
         reasons = []
-        if row["volume_fp"] is None or row["volume_fp"] < MIN_VOLUME_FP:
+        if dollar_volume_by_ticker is None:
+            if row["volume_fp"] is None or row["volume_fp"] < MIN_VOLUME_FP:
+                reasons.append("volume_below_1000")
+        elif row["pass2_status"] != "done":
+            reasons.append("dollar_volume_not_yet_fetched")
+        elif dollar_volume_by_ticker.get(row["ticker"], 0.0) < MIN_VOLUME_FP:
             reasons.append("volume_below_1000")
         if not row["quote_attempted"]:
             reasons.append("spread_filter_not_yet_fetched")
@@ -120,11 +144,14 @@ def summarize(results: list[FilterResult]) -> dict[str, Any]:
     return {"total": total, "passed": passed, "failed": total - passed, "reason_counts": reason_counts}
 
 
-def apply_and_log(conn, window: str = "r1") -> dict[str, Any]:
+def apply_and_log(
+    conn, window: str = "r1", dollar_volume_by_ticker: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """Runs the filters and persists every exclusion to universe_log
     (spec-wide defense against selection-bias claims -- see db.py's own
-    universe_log docstring)."""
-    results = apply_r1_filters(conn, window=window)
+    universe_log docstring). See apply_r1_filters for
+    `dollar_volume_by_ticker`."""
+    results = apply_r1_filters(conn, window=window, dollar_volume_by_ticker=dollar_volume_by_ticker)
     exclusions = [
         (r.ticker, code) for r in results if not r.passed for code in r.reason_codes
     ]

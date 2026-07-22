@@ -44,7 +44,7 @@ def _prepare_locked_r2(cli_env):
     from kalshi_mt import cli
 
     conn, tmp_path = cli_env
-    _seed_full_fixture(conn)
+    _seed_full_fixture(conn, TradeStore(tmp_path / "parquet"))
     conn.close()
     _write_frozen_mix(tmp_path / "data" / "frozen_2024_mix.json")
     _seed_trades_for_all_r2_markets(tmp_path)

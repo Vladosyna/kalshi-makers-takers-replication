@@ -245,12 +245,19 @@ def build() -> None:
         write_frozen_2024_mix,
     )
     from kalshi_mt.store import db
+    from kalshi_mt.store.parquet import TradeStore
     from kalshi_mt.util import PROJECT_ROOT
 
     config = load_config()
     conn = db.connect(config["storage"]["db_path"])
     try:
-        filter_summary = apply_and_log(conn, window="r1")
+        trade_store = TradeStore(config["storage"]["parquet_dir"])
+        # The TRUE $1k dollar-notional gate (2026-07-21 audit -- volume_fp
+        # is a contract count, not dollars); computed from Pass 2's full
+        # trade tape, not the cheap volume_fp proxy Pass 1/2 use only to
+        # SCOPE which markets get an expensive fetch in the first place.
+        dollar_volume_by_ticker = trade_store.dollar_volume_by_ticker()
+        filter_summary = apply_and_log(conn, window="r1", dollar_volume_by_ticker=dollar_volume_by_ticker)
         in_scope = {
             r[0] for r in conn.execute(
                 "SELECT ticker FROM markets m WHERE m.in_r1_window = 1 "
@@ -379,6 +386,7 @@ def r2() -> None:
     from kalshi_mt.r2.report import build_r2_report, load_r2_report, write_r2_report
     from kalshi_mt.r2.verdicts import determine_verdict
     from kalshi_mt.store import db
+    from kalshi_mt.store.parquet import TradeStore
     from kalshi_mt.util import PROJECT_ROOT
 
     config = load_config()
@@ -396,7 +404,11 @@ def r2() -> None:
         # apply_and_log is idempotent (re-running just re-derives the same
         # exclusions), so calling it here rather than requiring a separate
         # `kmt build --window r2` step keeps `kmt r2` runnable on its own.
-        r2_filter_summary = apply_and_log(conn, window="r2")
+        trade_store = TradeStore(config["storage"]["parquet_dir"])
+        dollar_volume_by_ticker = trade_store.dollar_volume_by_ticker()
+        r2_filter_summary = apply_and_log(
+            conn, window="r2", dollar_volume_by_ticker=dollar_volume_by_ticker
+        )
         r1_scope = {
             r[0] for r in conn.execute(
                 "SELECT ticker FROM markets m WHERE m.in_r1_window = 1 "
@@ -552,9 +564,11 @@ def _compute_escalation(config: dict) -> dict:
     delta_bar_pub = DeltaBarEstimate(**pub_bar) if pub_bar else None
 
     fee_schedule = load_fee_schedule()
+    trade_store = TradeStore(config["storage"]["parquet_dir"])
     conn = db.connect(config["storage"]["db_path"])
     try:
-        apply_and_log(conn, window="r2")
+        dollar_volume_by_ticker = trade_store.dollar_volume_by_ticker()
+        apply_and_log(conn, window="r2", dollar_volume_by_ticker=dollar_volume_by_ticker)
         r2_scope = {
             r[0] for r in conn.execute(
                 "SELECT ticker FROM markets m WHERE m.in_r2_window = 1 "
@@ -573,7 +587,6 @@ def _compute_escalation(config: dict) -> dict:
     finally:
         conn.close()
 
-    trade_store = TradeStore(config["storage"]["parquet_dir"])
     trades = trade_store.read_all()
     maker_margin = compute_maker_margin_ge_50c(trades, resolutions, categories, fee_schedule, r2_scope)
 
