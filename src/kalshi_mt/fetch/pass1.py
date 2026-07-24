@@ -657,6 +657,7 @@ async def run_pass1(
     panel_written = 0
     quotes_written = 0
     markets_processed = 0
+    markets_failed = 0
     last_ticker = ""
     while market_processing_limit is None or markets_processed < market_processing_limit:
         budget = _PANEL_QUOTE_CHUNK_SIZE
@@ -666,9 +667,26 @@ async def run_pass1(
         rows = conn.execute(chunk_query, [*extra_params, last_ticker, budget]).fetchall()
         if not rows:
             break
-        per_market_results = await asyncio.gather(*[_process_market(row) for row in rows])
-        panel_written += sum(r[0] for r in per_market_results)
-        quotes_written += sum(r[1] for r in per_market_results)
+        # return_exceptions=True: an upstream 5xx that exhausts tenacity's
+        # retries on ONE market must not crash the whole collector and lose
+        # every other in-flight market's progress this chunk -- confirmed
+        # live (2026-07-24), a single historical-trades 500 propagated
+        # uncaught through gather and killed the process. A failed market
+        # simply has no quotes row, so it stays selectable by the `NOT IN
+        # quotes` resume predicate and is retried on the next run/chunk --
+        # no special bookkeeping needed beyond logging it and not crediting
+        # its (nonexistent) panel/quote counts. Same fix already applied to
+        # discover_historical_series for the identical failure class.
+        per_market_results = await asyncio.gather(
+            *[_process_market(row) for row in rows], return_exceptions=True
+        )
+        for row, result in zip(rows, per_market_results):
+            if isinstance(result, BaseException):
+                markets_failed += 1
+                log.warning("panel/quote fetch failed for %s: %r", row["ticker"], result)
+                continue
+            panel_written += result[0]
+            quotes_written += result[1]
         markets_processed += len(rows)
         last_ticker = rows[-1]["ticker"]
 
@@ -677,6 +695,7 @@ async def run_pass1(
         "historical_discovery": hist_stats,
         "series_resolution": resolve_stats,
         "markets_processed": markets_processed,
+        "markets_failed": markets_failed,
         "panel_rows_written": panel_written,
         "quotes_written": quotes_written,
     }
